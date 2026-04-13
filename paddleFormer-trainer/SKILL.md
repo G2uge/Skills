@@ -1,5 +1,5 @@
 ---
-name: paddle-trainer2
+name: paddleFormer-trainer
 description: |
   基于GPU配置自动生成XPU训练配置并启动PaddleFormer模型训练。
   支持智能YAML检索、GPU→XPU配置自动转换、错误检测与自修复等高级功能。
