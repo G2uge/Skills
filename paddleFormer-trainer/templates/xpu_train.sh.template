@@ -1,0 +1,161 @@
+#!/bin/bash
+# XPU 训练启动脚本
+# 自动生成，请勿手动修改
+# 生成时间: {{GENERATED_TIME}}
+
+set -e
+
+# =============================================================================
+# 配置变量（动态替换）
+# =============================================================================
+MODEL_NAME="{{MODEL_NAME}}"
+CONFIG_FILE="{{CONFIG_FILE}}"
+OUTPUT_DIR="{{OUTPUT_DIR}}"
+NUM_XPUS={{NUM_XPUS}}
+XPU_DEVICES="{{XPU_DEVICES}}"
+
+# =============================================================================
+# 固定参数（不可修改）
+# =============================================================================
+# API trace 配置路径
+export FLAGS_trace_api="/root/paddlejob/zhangxiao_dev/qwen/api.yaml,/root/paddlejob/zhangxiao_dev/qwen/api_config.txt"
+
+# 动态库路径
+export LD_LIBRARY_PATH=/root/paddlejob/zhangxiao_dev/qwen_env/lib/python3.10/site-packages/paddle/libs/:${LD_LIBRARY_PATH}
+
+# XPU 算子黑名单
+export XPU_BLACK_LIST="index_elementwise_put,index_elementwise_put_with_tensor,index_elementwise_put_with_tensor_grad,index_elementwise_put_grad"
+
+# =============================================================================
+# 默认参数（可覆盖）
+# =============================================================================
+# 训练器数量
+export PADDLE_TRAINERS_NUM=${PADDLE_TRAINERS_NUM:-1}
+
+# BKCL 通信配置
+export BKCL_TIMEOUT=${BKCL_TIMEOUT:-1000}
+export BKCL_SOCKET_IFNAME=${BKCL_SOCKET_IFNAME:-eth0}
+export BKCL_ENABLE_XDR=${BKCL_ENABLE_XDR:-1}
+export BKCL_DEEPEP_NORMAL_CLUSTER_NUM=${BKCL_DEEPEP_NORMAL_CLUSTER_NUM:-${NUM_XPUS}}
+
+# 网络优化
+export BKCL_FORCE_RDMA_NICS_ORDER=${BKCL_FORCE_RDMA_NICS_ORDER:-"eth1,eth1,eth2,eth2,eth3,eth3,eth4,eth4"}
+
+# XSHMEM 优化
+export XSHMEM_MODE=${XSHMEM_MODE:-1}
+export XSHMEM_QP_NUM_PER_RANK=${XSHMEM_QP_NUM_PER_RANK:-24}
+export BKCL_USE_AR=${BKCL_USE_AR:-1}
+export BKCL_RING_OPT=${BKCL_RING_OPT:-1}
+export BKCL_USE_RDMA=${BKCL_USE_RDMA:-1}
+export BKCL_FORCE_L3_RDMA=${BKCL_FORCE_L3_RDMA:-0}
+export BKCL_RDMA_VERBS=${BKCL_RDMA_VERBS:-1}
+
+# XPU 设备配置
+export XPU_VISIBLE_DEVICES=${XPU_VISIBLE_DEVICES:-${XPU_DEVICES}}
+
+# =============================================================================
+# 环境清理
+# =============================================================================
+echo "=== 清理环境 ==="
+
+# 清理旧的分布式日志
+rm -rf ${OUTPUT_DIR}/paddleformers_dist_log
+
+# 取消 Paddle 分布式环境变量
+unset PADDLE_ELASTIC_JOB_ID 2>/dev/null || true
+unset PADDLE_TRAINER_ENDPOINTS 2>/dev/null || true
+unset DISTRIBUTED_TRAINER_ENDPOINTS 2>/dev/null || true
+unset FLAGS_START_PORT 2>/dev/null || true
+unset PADDLE_ELASTIC_TIMEOUT 2>/dev/null || true
+
+# 清理共享内存
+echo "清理共享内存..."
+for id in $(ipcs -m 2>/dev/null | awk '/0x/ {print $2}'); do
+    ipcrm -m $id 2>/dev/null || true
+done
+
+# 清理残留的 Python 进程（可选，谨慎使用）
+# pkill -9 python 2>/dev/null || true
+
+# =============================================================================
+# 激活 Python 环境
+# 环境路径: {{PYTHON_ENV_PATH}}
+# =============================================================================
+echo "=== 激活环境 ==="
+if [ -z "{{PYTHON_ENV_PATH}}" ]; then
+    echo "错误: 未指定 Python 环境路径"
+    echo "请在配置中设置 PYTHON_ENV_PATH"
+    exit 1
+fi
+
+if [ ! -f "{{PYTHON_ENV_PATH}}/bin/activate" ]; then
+    echo "错误: 环境激活脚本不存在: {{PYTHON_ENV_PATH}}/bin/activate"
+    exit 1
+fi
+
+source {{PYTHON_ENV_PATH}}/bin/activate
+
+# 验证环境
+python -c "import paddle; print(f'Paddle version: {paddle.__version__}')" || {
+    echo "错误: Paddle 环境未正确激活"
+    exit 1
+}
+
+# =============================================================================
+# 验证配置
+# =============================================================================
+echo "=== 验证配置 ==="
+if [ ! -f "${CONFIG_FILE}" ]; then
+    echo "错误: 配置文件不存在: ${CONFIG_FILE}"
+    exit 1
+fi
+
+echo "模型名称: ${MODEL_NAME}"
+echo "配置文件: ${CONFIG_FILE}"
+echo "输出目录: ${OUTPUT_DIR}"
+echo "XPU 设备: ${XPU_VISIBLE_DEVICES}"
+echo "设备数量: ${NUM_XPUS}"
+
+# 创建输出目录
+mkdir -p ${OUTPUT_DIR}
+
+# =============================================================================
+# 启动训练
+# =============================================================================
+echo "=== 启动训练 ==="
+echo "开始时间: $(date '+%Y-%m-%d %H:%M:%S')"
+
+# 使用 nohup 确保训练不会因会话断开而停止
+nohup paddleformers-cli train ${CONFIG_FILE} > ${OUTPUT_DIR}/train.log 2>&1 &
+TRAIN_PID=$!
+
+# 保存 PID
+echo $TRAIN_PID > ${OUTPUT_DIR}/.train_pid
+echo ${TRAIN_PID} > ${OUTPUT_DIR}/train.pid
+
+echo ""
+echo "========================================"
+echo "训练已在后台启动"
+echo "========================================"
+echo "进程 PID: ${TRAIN_PID}"
+echo "配置文件: ${CONFIG_FILE}"
+echo "Shell 日志: ${OUTPUT_DIR}/train.log"
+echo "分布式日志: ${OUTPUT_DIR}/paddleformers_dist_log/workerlog.*"
+echo "========================================"
+
+# 等待短暂时间确认进程启动
+sleep 5
+
+# 验证进程是否还在运行
+if ps -p ${TRAIN_PID} > /dev/null 2>&1; then
+    echo "✅ 训练进程正常运行"
+    echo ""
+    echo "监控命令:"
+    echo "  tail -f ${OUTPUT_DIR}/paddleformers_dist_log/workerlog.0"
+    echo "  tail -f ${OUTPUT_DIR}/train.log"
+    exit 0
+else
+    echo "❌ 训练启动失败，请检查日志:"
+    echo "  tail -50 ${OUTPUT_DIR}/train.log"
+    exit 1
+fi

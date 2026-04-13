@@ -1,0 +1,310 @@
+# Workflow: Qwen3-VL-30B-A3B-Thinking XPU 训练流程
+# 
+# 该 Workflow 用于自动化执行 Qwen3-VL-30B-A3B-Thinking 模型的 XPU 训练任务
+# 包含两个阶段：
+#   阶段1: 配置生成 - 自动生成 XPU 训练配置和启动脚本
+#   阶段2: 训练启动 - 基于生成的配置启动模型训练
+#
+# 使用方法:
+#   触发该 Workflow 即可自动完成从配置生成到训练启动的完整流程
+
+workflow:
+  # ==================== 基本信息 ====================
+  metadata:
+    name: train_qwen3vl_30b_a3b_thinking
+    display_name: Qwen3-VL-30B-A3B-Thinking XPU 训练
+    description: |
+      自动化训练 Qwen3-VL-30B-A3B-Thinking 模型的完整 Workflow。
+      自动完成 PaddleFormers 仓库定位、GPU YAML 检索、XPU 配置转换、
+      启动脚本生成和训练启动。
+    version: "1.0.0"
+    author: "PaddleFormer Team"
+    skill_dependency: paddle-trainer2
+
+  # ==================== 输入参数 ====================
+  inputs:
+    # 模型相关参数
+    model_name:
+      type: string
+      default: "Qwen3-VL-30B-A3B-Thinking"
+      description: "模型名称"
+      readonly: true  # 该 Workflow 专为该模型设计
+
+    model_name_or_path:
+      type: string
+      default: "/root/paddlejob/zhangxiao_dev/data/Qwen3-VL-30B-A3B-Thinking"
+      description: "模型权重路径"
+      required: false
+
+    train_dataset_path:
+      type: string
+      default: "/root/paddlejob/Gruge/data/coco_grounding/train.jsonl"
+      description: "训练数据集路径（JSONL格式）"
+      required: false
+
+    eval_dataset_path:
+      type: string
+      default: "/root/paddlejob/Gruge/data/coco_grounding/val2.jsonl"
+      description: "评估数据集路径（JSONL格式）"
+      required: false
+
+    # 路径相关参数
+    output_dir:
+      type: string
+      default: "./output"
+      description: "训练输出根目录"
+      required: false
+
+    paddleformers_root:
+      type: string
+      default: ""
+      description: "PaddleFormers 仓库根目录（留空自动搜索）"
+      required: false
+
+    # 训练相关参数
+    max_steps:
+      type: integer
+      default: 100
+      description: "最大训练步数"
+      required: false
+
+    max_repair_attempts:
+      type: integer
+      default: 3
+      description: "最大错误修复尝试次数"
+      required: false
+
+    auto_start_training:
+      type: boolean
+      default: true
+      description: "配置生成后是否自动启动训练"
+      required: false
+
+  # ==================== 阶段定义 ====================
+  stages:
+
+    # ==================== 阶段1: 配置生成 ====================
+    - name: generate_config
+      display_name: 生成训练配置
+      description: |
+        基于 paddle-trainer2 Skill 自动生成 XPU 训练配置。
+        包含以下步骤：
+        1. 定位 PaddleFormers 仓库
+        2. 检索并选择最优 GPU YAML 配置
+        3. 执行 GPU→XPU 配置转换
+        4. 生成启动脚本
+        5. 总结工作流程
+
+      steps:
+        # Step 1: 初始化训练启动器
+        - name: init_launcher
+          action: execute_python
+          description: "初始化 TrainLauncher"
+          code: |
+            import sys
+            sys.path.insert(0, '{{WORKFLOW_ROOT}}/scripts')
+            from train_launcher import TrainLauncher
+
+            launcher = TrainLauncher(
+                paddleformers_root='{{inputs.paddleformers_root or None}}',
+                output_base_dir='{{inputs.output_dir}}'
+            )
+            print(f"✓ TrainLauncher 初始化完成")
+            print(f"  输出目录: "{{inputs.output_dir}}"")
+
+        # Step 2: 准备训练配置
+        - name: prepare_training
+          action: call_skill
+          description: "调用 paddle-trainer2 Skill 生成配置"
+          skill: paddle-trainer2
+          method: prepare_training
+          inputs:
+            model_name: "{{inputs.model_name}}"
+            gpu_yaml_path: null  # 让 Agent 自动检索选择
+            custom_params:
+              model_name_or_path: "{{inputs.model_name_or_path}}"
+              train_dataset_path: "{{inputs.train_dataset_path}}"
+              eval_dataset_path: "{{inputs.eval_dataset_path}}"
+              max_steps: "{{inputs.max_steps}}"
+              learning_rate: "{{inputs.learning_rate}}"
+              per_device_train_batch_size: "{{inputs.per_device_train_batch_size}}"
+              gradient_accumulation_steps: "{{inputs.gradient_accumulation_steps}}"
+              num_train_epochs: "{{inputs.num_train_epochs}}"
+            allow_fallback: "{{inputs.allow_fallback}}"
+          outputs:
+            xpu_yaml_path: "${xpu_yaml_path}"
+            script_path: "${script_path}"
+            config_info: "${config_info}"
+            candidate_data: "${candidate_data}"
+
+        # Step 3: 展示配置摘要
+        - name: display_summary
+          action: execute_python
+          description: "展示生成的配置摘要"
+          code: |
+            print("\n" + "="*60)
+            print("配置生成完成")
+            print("="*60)
+            print(f"\n📋 模型信息:")
+            print(f"  模型名称: "{{inputs.model_name}}"")
+            print(f"  模型路径: "{{inputs.model_name_or_path}}"")
+            print(f"  训练数据: "{{inputs.train_dataset_path}}"")
+            print(f"\n📁 输出文件:")
+            print(f"  XPU 配置: ${{outputs.prepare_training.xpu_yaml_path}}")
+            print(f"  启动脚本: ${{outputs.prepare_training.script_path}}")
+            print(f"  输出目录: "{{inputs.output_dir}}"")
+            print(f"\n🔧 关键训练参数:")
+            print(f"  Max Steps: "{{inputs.max_steps}}"")
+            print(f"  Learning Rate: "{{inputs.learning_rate}}"")
+            print(f"  Batch Size: "{{inputs.per_device_train_batch_size}}"")
+            print(f"  Gradient Accumulation: "{{inputs.gradient_accumulation_steps}}"")
+            print("="*60)
+
+        # Step 4: 自主总结工作流程
+        - name: summarize_workflow
+          action: generate_text
+          description: "总结本次配置生成的工作流程"
+          prompt: |
+            请基于以下信息，总结本次配置生成的工作流程：
+            
+            模型名称: "{{inputs.model_name}}"
+            候选 YAML 数据: ${{outputs.prepare_training.candidate_data}}
+            生成的 XPU 配置路径: ${{outputs.prepare_training.xpu_yaml_path}}
+            
+            请总结以下内容：
+            1. PaddleFormers 仓库定位方式
+            2. GPU YAML 选择理由（分析候选数据说明为何选择该配置）
+            3. GPU→XPU 配置转换的关键调整
+            4. 输出文件结构说明
+            
+            用清晰的格式输出，帮助用户理解整个配置生成过程。
+
+      outputs:
+        xpu_yaml_path: "${steps.prepare_training.outputs.xpu_yaml_path}"
+        script_path: "${steps.prepare_training.outputs.script_path}"
+        config_info: "${steps.prepare_training.outputs.config_info}"
+
+    # ==================== 阶段2: 训练启动 ====================
+    - name: start_training
+      display_name: 启动模型训练
+      description: |
+        基于阶段1生成的配置启动模型训练。
+        支持自动错误检测和修复，最多尝试 {{inputs.max_repair_attempts}} 次。
+      
+      # 执行条件：用户选择自动启动 或 明确要训练
+      condition: "{{inputs.auto_start_training}}"
+
+      depends_on:
+        - generate_config
+
+      steps:
+        # Step 1: 启动训练
+        - name: launch_training
+          action: call_skill
+          description: "启动训练（支持自动修复）"
+          skill: paddle-trainer2
+          method: run_with_repair
+          inputs:
+            model_name: "{{inputs.model_name}}"
+            max_attempts: "{{inputs.max_repair_attempts}}"
+            custom_params:
+              model_name_or_path: "{{inputs.model_name_or_path}}"
+              train_dataset_path: "{{inputs.train_dataset_path}}"
+              eval_dataset_path: "{{inputs.eval_dataset_path}}"
+              max_steps: "{{inputs.max_steps}}"
+              learning_rate: "{{inputs.learning_rate}}"
+              per_device_train_batch_size: "{{inputs.per_device_train_batch_size}}"
+              gradient_accumulation_steps: "{{inputs.gradient_accumulation_steps}}"
+              num_train_epochs: "{{inputs.num_train_epochs}}"
+          outputs:
+            success: "${success}"
+            pid: "${pid}"
+            output_dir: "${output_dir}"
+            error: "${error}"
+            attempts: "${attempts}"
+
+        # Step 2: 展示训练状态
+        - name: display_status
+          action: execute_python
+          description: "展示训练启动状态"
+          code: |
+            success = ${{outputs.launch_training.success}}
+            
+            if success:
+                print("\n" + "="*60)
+                print("🎉 训练启动成功！")
+                print("="*60)
+                print(f"  PID: ${{outputs.launch_training.pid}}")
+                print(f"  输出目录: ${{outputs.launch_training.output_dir}}")
+                print(f"  尝试次数: ${{outputs.launch_training.attempts}}")
+                print(f"\n📊 监控命令:")
+                print(f"  tail -f ${{outputs.launch_training.output_dir}}/paddleformers_dist_log/workerlog.0")
+                print("="*60)
+            else:
+                print("\n" + "="*60)
+                print("❌ 训练启动失败")
+                print("="*60)
+                print(f"  错误信息: ${{outputs.launch_training.error}}")
+                print(f"  尝试次数: ${{outputs.launch_training.attempts}}")
+                print("="*60)
+
+      outputs:
+        training_success: "${steps.launch_training.outputs.success}"
+        training_pid: "${steps.launch_training.outputs.pid}"
+        training_output_dir: "${steps.launch_training.outputs.output_dir}"
+        training_attempts: "${steps.launch_training.outputs.attempts}"
+
+  # ==================== 工作流输出 ====================
+  outputs:
+    # 配置生成阶段输出
+    xpu_config_path:
+      description: "生成的 XPU 配置文件路径"
+      value: "${stages.generate_config.outputs.xpu_yaml_path}"
+
+    launch_script_path:
+      description: "生成的启动脚本路径"
+      value: "${stages.generate_config.outputs.script_path}"
+
+    output_directory:
+      description: "训练输出目录"
+      value: "{{inputs.output_dir}}"
+
+    # 训练启动阶段输出（如果执行了该阶段）
+    training_status:
+      description: "训练启动状态"
+      value: "${stages.start_training.outputs.training_success or 'skipped'}"
+
+    training_pid:
+      description: "训练进程 PID"
+      value: "${stages.start_training.outputs.training_pid or 'N/A'}"
+
+    training_attempts:
+      description: "训练启动尝试次数"
+      value: "${stages.start_training.outputs.training_attempts or 0}"
+
+  # ==================== 使用说明 ====================
+  usage:
+    quick_start: |
+      # 快速启动训练（使用默认参数）
+      直接触发该 Workflow，将自动完成配置生成和训练启动
+
+    with_custom_params: |
+      # 使用自定义参数
+      在触发 Workflow 时传入以下参数：
+        - model_name_or_path: "/data/models/Qwen3-VL-30B-A3B"
+        - train_dataset_path: "/data/coco/train.jsonl"
+        - max_steps: 1000
+        - learning_rate: "5.0e-5"
+
+    manual_start: |
+      # 仅生成配置，手动启动训练
+      设置 auto_start_training: false
+      Workflow 将只生成配置和脚本，不自动启动训练
+
+  # ==================== 注意事项 ====================
+  notes:
+    - "该 Workflow 专为 Qwen3-VL-30B-A3B-Thinking 模型设计，model_name 参数不可修改"
+    - "若 PaddleFormers 仓库中找不到对应 GPU YAML，可通过设置 allow_fallback: true 使用参考配置"
+    - "训练过程中如遇错误，会自动尝试修复，最多 {{inputs.max_repair_attempts}} 次"
+    - "建议训练前确认模型权重文件已放置在 model_name_or_path 指定路径"
+    - "数据集需为 JSONL 格式，路径通过 train_dataset_path 指定"

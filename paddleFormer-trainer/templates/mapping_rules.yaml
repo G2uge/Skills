@@ -1,0 +1,859 @@
+# GPU → XPU 配置映射规则定义
+# version: 2.1 - 基于 Qwen3-VL-30B 实际配置对比分析更新
+# 分析来源:
+#   - GPU YAML: Qwen3-VL-30B-A3B-Instruct.yaml (PaddleFormers GPU训练配置)
+#   - XPU YAML: Qwen3-VL-30B-A3B-Thinking.yaml (已验证XPU运行配置)
+
+# =============================================================================
+# 1. 字段映射规则 - 字段名称或值的直接替换
+# =============================================================================
+field_mappings:
+  # 1.1 设备类型字段（核心）
+  device:
+    source_key: null  # 可能不存在于GPU配置中
+    target_key: "device"
+    target_value: "xpu"
+    rule_type: "add_if_missing"
+    priority: 1
+    description: "XPU必需字段，GPU配置通常省略（默认cuda）"
+
+  # 1.2 Attention实现方式（字段名变更）
+  attention_implementation:
+    source_key: "_attn_implementation"
+    target_key: "attn_impl"
+    target_value: null  # 需要注释掉或由用户指定
+    rule_type: "rename_and_optional"
+    priority: 2
+    description: "GPU使用_flashmask，XPU需要显式指定或禁用"
+    action_on_xpu: "comment_out"  # XPU下建议注释掉
+
+  # 1.3 后端通信（如果出现）
+  distributed_backend:
+    source_key: "backend"
+    target_value: "bkcl"
+    rule_type: "replace_value"
+    condition: "if_nccl"
+
+# =============================================================================
+# 2. 参数变换规则 - 参数值的调整逻辑
+# =============================================================================
+parameter_transformations:
+  # 2.1 训练步数相关参数（根据任务和硬件调整）
+  training_steps:
+    parameters:
+      - key: "max_steps"
+        transformation_type: "task_dependent"
+        gpu_value: 500    # Instruct任务
+        xpu_value: 100    # Thinking任务（示例）
+        rule: "根据具体训练任务调整，非硬件差异"
+        auto_adjust: false
+
+      - key: "save_steps"
+        transformation_type: "derived"
+        rule: "通常与max_steps保持一致或按比例调整"
+        gpu_value: 500
+        xpu_value: 100
+
+      - key: "gradient_accumulation_steps"
+        transformation_type: "hardware_dependent"
+        gpu_value: 16
+        xpu_value: 8
+        rule: "根据XPU显存和通信特性调整，通常为GPU的一半或自动计算"
+        auto_adjust: true
+        adjustment_logic: |
+          if xpu_memory < gpu_memory:
+            adjustment_factor = gpu_memory / xpu_memory
+            new_value = max(1, int(gpu_value / adjustment_factor))
+
+  # 2.2 数据加载参数
+  data_loading:
+    - key: "packing"
+      transformation_type: "boolean_toggle"
+      gpu_value: true
+      xpu_value: false
+      rule: "XPU可能对packing支持不同，需根据实际测试调整"
+      description: "数据打包策略，XPU建议关闭以简化内存管理"
+
+  # 2.3 性能分析参数
+  profiling:
+    - key: "benchmark"
+      transformation_type: "boolean_toggle"
+      gpu_value: true
+      xpu_value: false
+      rule: "XPU环境建议关闭benchmark模式以确保稳定性"
+
+  # 2.4 精度相关参数
+  precision:
+    - key: "bf16"
+      transformation_type: "preserve"
+      rule: "XPU支持bf16，与GPU保持一致"
+      note: "XPU对bf16支持良好，无需修改"
+
+    - key: "fp16_opt_level"
+      transformation_type: "preserve_or_remove"
+      rule: "如果XPU使用bf16，可保留但可能不生效"
+      xpu_recommendation: "保留以兼容，但XPU主要使用bf16"
+
+# =============================================================================
+# 3. 结构调整规则 - 配置结构的增删变化
+# =============================================================================
+structural_adjustments:
+  # 3.1 GPU特有字段移除（如果存在）
+  remove_gpu_specific:
+    fields:
+      - "cuda_.*"
+      - "nccl_.*"
+      - ".*_cuda"
+      - ".*_nccl"
+      - "gpu_nums"
+      - "use_cuda"
+    description: "移除所有CUDA/NCCL相关配置"
+    action: "delete"
+
+  # 3.2 XPU特有字段添加
+  add_xpu_specific:
+    fields:
+      - key: "device"
+        value: "xpu"
+        position: "end_of_file"
+        description: "XPU必需字段，声明设备类型"
+
+  # 3.3 注释掉XPU不支持的特性（字段保留但注释）
+  comment_out_for_xpu:
+    fields:
+      - key: "_attn_implementation"
+        reason: "XPU对flashmask支持可能需要特殊版本"
+        alternative: "attn_impl"
+
+      - key: "moe_deep_gemm"
+        reason: "Deep GEMM可能是GPU特有优化"
+        note: "如有XPU版本可启用"
+
+      - key: "fuse_attention_qkv"
+        reason: "XPU融合算子支持情况需验证"
+        status: "experimental"
+
+      - key: "fuse_attention_ffn"
+        reason: "XPU融合算子支持情况需验证"
+        status: "experimental"
+
+      - key: "fuse_rms_norm"
+        reason: "XPU RMSNorm融合支持需验证"
+        status: "experimental"
+
+      - key: "tp_delay_scale_loss"
+        reason: "TP延迟scale loss在XPU上可能不需要"
+        note: "根据性能测试结果决定是否启用"
+
+      - key: "moe_router_force_load_balancing"
+        reason: "强制负载均衡策略可能需要XPU适配"
+        status: "optional"
+
+  # 3.4 新增XPU优化字段（可选但推荐）
+  add_xpu_optimizations:
+    fields:
+      - key: "pp_delay_scale_loss"
+        value: true
+        condition: "if_pipeline_parallel"
+        description: "PP延迟scale loss，XPU上可能有益"
+
+# =============================================================================
+# 4. 默认值与补全规则 - 缺失字段的默认值
+# =============================================================================
+default_values:
+  # 4.1 核心必需字段（必须存在）
+  required_fields:
+    device: "xpu"
+    bf16: true
+    amp_master_grad: true
+
+  # 4.2 XPU通信配置（缺失时补全）
+  communication:
+    bkcl_timeout: 1000
+    bkcl_socket_ifname: "eth0"
+    bkcl_enable_xdr: 1
+    bkcl_use_rdma: 1
+
+  # 4.3 并行策略（基于硬件自动计算）
+  parallelism:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 8  # 根据XPU数量
+    sequence_parallel: false
+    use_expert_parallel: true
+
+  # 4.4 性能优化（推荐值）
+  performance:
+    moe_grouped_gemm: true
+    apply_rope_fusion: false
+    recompute_granularity: "full"
+    recompute_method: "uniform"
+
+  # 4.5 训练参数（安全默认值）
+  training:
+    per_device_train_batch_size: 1
+    per_device_eval_batch_size: 1
+    gradient_accumulation_steps: 8
+    learning_rate: "1.0e-4"
+    warmup_steps: 20
+    num_train_epochs: 1
+    max_steps: 100
+    save_steps: 100
+    eval_steps: 200
+    logging_steps: 1
+
+# =============================================================================
+# 5. 模式级规则抽象 - 通用转换模式
+# =============================================================================
+pattern_rules:
+  # 5.1 后端统一替换模式
+  backend_unification:
+    description: "所有通信后端统一替换为XPU对应实现"
+    patterns:
+      - source: "nccl"
+        target: "bkcl"
+        scope: ["backend", "distributed_backend", "communication_backend"]
+
+      - source: "cuda"
+        target: "xpu"
+        scope: ["device", "device_type", ".*_device"]
+
+  # 5.2 融合算子处理模式
+  fusion_operator_handling:
+    description: "GPU融合算子在XPU上的处理策略"
+    strategy: "comment_and_test"
+    rules:
+      - pattern: "fuse_.*"
+        action: "comment_out"
+        reason: "融合算子需要XPU特定实现支持"
+        note: "注释后根据测试情况逐步启用"
+
+      - pattern: ".*_fusion"
+        action: "comment_out"
+        reason: "同上"
+
+  # 5.3 内存优化模式
+  memory_optimization:
+    description: "根据硬件内存调整训练参数"
+    auto_scale_parameters:
+      - parameter: "gradient_accumulation_steps"
+        base_on: "per_device_train_batch_size"
+        rule: "保持effective_batch_size = batch_size × accumulation × num_devices"
+
+      - parameter: "recompute_num_layers"
+        condition: "if_memory_constrained"
+        rule: "增加重计算层数以减少显存占用"
+
+  # 5.4 精度模式
+  precision_mode:
+    description: "XPU默认使用bf16，保持与GPU一致"
+    rules:
+      - if_gpu_fp16: "convert_to_bf16_for_xpu"
+      - if_gpu_bf16: "preserve_bf16"
+      - fp16_opt_level: "optional_preserve"
+
+  # 5.5 任务适配模式
+  task_adaptation:
+    description: "根据训练任务类型调整参数"
+    task_types:
+      pretrain:
+        max_steps: 100000
+        save_steps: 1000
+
+      sft:
+        max_steps: -1
+        num_train_epochs: 3
+
+      instruct:
+        max_steps: 500
+        learning_rate: "1.0e-4"
+
+      thinking:
+        max_steps: 100
+        learning_rate: "5.0e-5"
+
+      vl_sft:
+        max_steps: 100
+        freeze_config: "freeze_vision freeze_aligner"
+
+# =============================================================================
+# 6. 模型特定规则
+# =============================================================================
+model_specific_rules:
+  # Qwen3-VL 系列规则
+  "Qwen3-VL.*":
+    description: "基于Qwen3-VL-30B-A3B配置分析"
+    derived_from: "Qwen3-VL-30B-A3B对比分析"
+
+    # 必需字段
+    required:
+      freeze_config: "freeze_vision freeze_aligner"
+      template: "qwen3_vl"
+      moe_grouped_gemm: true
+      use_expert_parallel: true
+
+    # 建议参数值
+    recommended:
+      max_seq_len: 8192
+      learning_rate: "1.0e-4"
+      per_device_train_batch_size: 1
+      tensor_model_parallel_size: 1
+      expert_model_parallel_size: 8
+
+    # XPU特定调整
+    xpu_adjustments:
+      gradient_accumulation_steps: 8  # 从16调整为8
+      packing: false  # 从true调整为false
+      benchmark: false  # 从true调整为false
+      device: "xpu"  # 新增
+
+    # 需要注释的字段
+    comment_out:
+      - "_attn_implementation"
+      - "moe_deep_gemm"
+      - "fuse_attention_qkv"
+      - "fuse_attention_ffn"
+      - "fuse_rms_norm"
+
+    # 可选新增字段
+    optional_add:
+      pp_delay_scale_loss: true
+
+  # Qwen3 Text 系列
+  "Qwen3.*Text.*|Qwen3-.*B(?!.*VL)":
+    required:
+      template: "qwen3"
+    recommended:
+      max_seq_len: 32768
+      learning_rate: "1.0e-4"
+
+  # DeepSeek MoE 系列
+  "DeepSeek.*|deepseek.*":
+    required:
+      moe_grouped_gemm: true
+      use_expert_parallel: true
+    xpu_adjustments:
+      moe_deep_gemm: "comment_out"  # XPU可能不支持deep_gemm
+
+# =============================================================================
+# 7. 转换执行流程（AI执行指导）
+# =============================================================================
+conversion_workflow:
+  step1_preprocess:
+    description: "预处理GPU配置"
+    actions:
+      - "读取GPU YAML文件"
+      - "解析所有字段和值"
+      - "识别模型类型和任务"
+
+  step2_field_mapping:
+    description: "应用字段映射规则"
+    actions:
+      - "替换字段名（如_attn_implementation → attn_impl）"
+      - "添加必需字段（device: xpu）"
+      - "替换后端值（nccl → bkcl）"
+
+  step3_parameter_transformation:
+    description: "应用参数变换"
+    actions:
+      - "调整gradient_accumulation_steps"
+      - "设置packing和benchmark为false"
+      - "根据任务类型调整max_steps"
+
+  step4_structural_adjustment:
+    description: "结构调整"
+    actions:
+      - "注释掉XPU不支持的字段"
+      - "添加XPU优化字段"
+      - "移除GPU特有字段"
+
+  step5_default_completion:
+    description: "默认值补全"
+    actions:
+      - "检查必需字段是否存在"
+      - "使用默认值补全缺失字段"
+      - "验证配置完整性"
+
+  step6_validation:
+    description: "验证和优化"
+    actions:
+      - "验证YAML语法"
+      - "检查字段依赖关系"
+      - "输出转换报告"
+
+# =============================================================================
+# 8. 验证规则
+# =============================================================================
+validation_rules:
+  required_fields:
+    - model_name_or_path
+    - output_dir
+    - device
+    - train_dataset_path
+
+  field_types:
+    num_train_epochs: [int, float]
+    max_steps: int
+    learning_rate: [str, float]
+    per_device_train_batch_size: int
+
+  allowed_values:
+    device: [xpu, cpu]
+    fine_tuning: [full, lora, qlora]
+    bf16: [true, false]
+    stage: [pretrain, sft, instruct, thinking, vl-sft, chat, rlhf, dpo]
+
+  cross_field_validation:
+    - rule: "if_use_expert_parallel_then_expert_model_parallel_size"
+      condition: "use_expert_parallel == true"
+      required: "expert_model_parallel_size"
+
+    - rule: "if_bf16_then_amp_master_grad"
+      condition: "bf16 == true"
+      recommended: "amp_master_grad == true"
+
+# =============================================================================
+# 9. 路径动态配置规则 - 模型路径和数据集路径的动态解析
+# =============================================================================
+path_configuration:
+  # 9.1 路径参数定义
+  path_parameters:
+    model_name_or_path:
+      description: "模型权重路径"
+      required: true
+      priority: "user_provided_first"
+      default_strategy: "cwd_based"
+      default_value: "./weights/{model_name}"
+      auto_create_directory: true
+      validation_rules:
+        - "path_exists_or_creatable"
+        - "not_empty"
+
+    train_dataset_path:
+      description: "训练数据集路径"
+      required: true
+      priority: "user_provided_first"
+      default_strategy: "cwd_based"
+      default_value: "./datasets/train.jsonl"
+      auto_create_directory: false
+      validation_rules:
+        - "file_exists_or_warn"
+
+    eval_dataset_path:
+      description: "评估数据集路径"
+      required: false
+      priority: "user_provided_first"
+      default_strategy: "cwd_based"
+      default_value: "./datasets/eval.jsonl"
+      auto_create_directory: false
+      validation_rules:
+        - "file_exists_or_optional"
+
+    dataset_output_dir:
+      description: "数据集预处理输出目录"
+      required: false
+      priority: "output_dir_derived"
+      default_strategy: "derived_from_output_dir"
+      default_value: "{output_dir}/dataset_cache"
+      auto_create_directory: true
+      validation_rules:
+        - "path_creatable"
+
+  # 9.2 路径解析规则
+  path_resolution_rules:
+    # 用户自定义路径优先
+    user_override:
+      description: "用户提供的路径优先级最高"
+      logic: |
+        if user_provided_paths.get('model_name_or_path'):
+          final_model_path = user_provided_paths['model_name_or_path']
+        else:
+          final_model_path = default_paths['model_name_or_path'].format(model_name=model_name)
+          create_directory_if_needed(final_model_path)
+
+    # 默认路径模板
+    default_templates:
+      weights_dir: "./weights"
+      datasets_dir: "./datasets"
+      checkpoints_dir: "./checkpoints"
+      logs_dir: "./vdl_log"
+
+    # 路径变量替换
+    path_variables:
+      - name: "{model_name}"
+        source: "input_parameter"
+        description: "从用户输入的模型名称"
+      - name: "{cwd}"
+        source: "current_working_directory"
+        description: "当前工作目录"
+      - name: "{timestamp}"
+        source: "generation_time"
+        description: "配置生成时间戳"
+
+  # 9.3 目录自动创建配置
+  directory_creation:
+    enabled: true
+    directories:
+      - path: "./weights"
+        description: "模型权重存储目录"
+        create_if_not_exists: true
+      - path: "./datasets"
+        description: "数据集存储目录"
+        create_if_not_exists: false  # 数据集通常已存在
+      - path: "./checkpoints"
+        description: "训练检查点输出目录"
+        create_if_not_exists: true
+      - path: "./vdl_log"
+        description: "VisualDL日志目录"
+        create_if_not_exists: true
+      - path: "{output_dir}/dataset_cache"
+        description: "数据集预处理缓存目录"
+        create_if_not_exists: true
+
+  # 9.4 路径验证规则
+  path_validation:
+    model_name_or_path:
+      - rule: "path_not_empty"
+        error_message: "模型路径不能为空"
+      - rule: "path_creatable"
+        error_message: "无法创建模型权重目录"
+      - rule: "warn_if_not_exists"
+        message: "模型权重路径不存在，请确保训练前将模型文件放入该目录"
+
+    train_dataset_path:
+      - rule: "path_not_empty"
+        error_message: "训练数据集路径不能为空"
+      - rule: "warn_if_not_exists"
+        message: "训练数据集文件不存在，请确认路径正确"
+
+# =============================================================================
+# 10. 智能检索相似性规则（保留）
+# =============================================================================
+model_family_mapping:
+  qwen3:
+    search_paths: ["qwen3_vl", "qwen3", "qwen2_5", "qwen2", "qwen"]
+    architecture: "transformer"
+
+structure_scoring:
+  weights:
+    exact_match: 25
+    similar: 15
+    neutral: 5
+    mismatch: 0
+
+scoring_weights:
+  architecture: 0.30
+  structure: 0.25
+  task: 0.20
+  size: 0.15
+  completeness: 0.10
+
+# =============================================================================
+# 11. 错误修复规则
+# =============================================================================
+repair_rules:
+  missing_parameter:
+    error_patterns:
+      - "KeyError:.*'(.+)'"
+    fix_strategy: "from_reference"
+
+  out_of_memory:
+    error_patterns:
+      - "XPU OOM"
+    fix_strategy: "reduce_batch_size"
+    adjustments:
+      - "gradient_accumulation_steps *= 2"
+      - "per_device_train_batch_size = max(1, per_device_train_batch_size - 1)"
+
+  communication_timeout:
+    error_patterns:
+      - "BKCL.*timeout"
+    fix_strategy: "increase_timeout"
+    adjustment: "bkcl_timeout *= 2"
+
+# =============================================================================
+# 12. Agent 驱动的错误处理规则
+# =============================================================================
+error_handling:
+  # 12.1 错误类型定义与 Agent 决策指导
+  error_types:
+    missing_parameter:
+      description: "配置参数缺失"
+      severity: "high"
+      agent_guidance: |
+        分析要点:
+        1. 确认缺失的参数名是否明确（从错误日志提取）
+        2. 判断该参数是否为 XPU 训练必需字段
+        3. 如果是必需字段，建议从 reference_config 补全
+        4. 如果不是必需字段，评估是否可以安全忽略
+      recommended_strategy: "FROM_REFERENCE"
+      auto_repair_safe: true
+      required_context: ["param_name", "reference_values"]
+
+    invalid_config:
+      description: "配置值无效或不合法"
+      severity: "high"
+      agent_guidance: |
+        分析要点:
+        1. 确认哪个参数值无效
+        2. 判断是值类型错误还是值范围错误
+        3. 如果是 device 相关，确保值为 "xpu"
+        4. 使用 reference_config 中的合法值替换
+      recommended_strategy: "USE_DEFAULT"
+      auto_repair_safe: true
+      required_context: ["param_name", "invalid_value", "reference_values"]
+
+    out_of_memory:
+      description: "XPU 显存不足"
+      severity: "critical"
+      agent_guidance: |
+        分析要点:
+        1. 检查当前 batch size 和 gradient_accumulation_steps
+        2. 评估有效 batch size = batch_size × accumulation
+        3. 决策优先级:
+           - 优先减小 per_device_train_batch_size（最小到1）
+           - 然后增加 gradient_accumulation_steps
+           - 最后考虑启用/增加 recompute_granularity
+        4. 确保修改后有效 batch size 保持合理
+      recommended_strategy: "REDUCE_BATCH_SIZE"
+      auto_repair_safe: true
+      required_context: ["current_batch_size", "current_accumulation", "reference_values"]
+      constraints:
+        min_batch_size: 1
+        max_accumulation_steps: 64
+
+    communication_timeout:
+      description: "BKCL 通信超时"
+      severity: "medium"
+      agent_guidance: |
+        分析要点:
+        1. 检查当前 bkcl_timeout 值
+        2. 如果小于 5000ms，建议加倍（不超过 5000ms）
+        3. 检查网络接口配置是否正确
+        4. 如果多次修复无效，建议人工检查网络环境
+      recommended_strategy: "INCREASE_TIMEOUT"
+      auto_repair_safe: true
+      required_context: ["current_timeout"]
+      constraints:
+        max_timeout: 5000
+        increment_factor: 2
+
+    network_interface:
+      description: "网络接口配置错误"
+      severity: "medium"
+      agent_guidance: |
+        分析要点:
+        1. 检查当前 bkcl_socket_ifname 值
+        2. 评估系统中可用的网络接口
+        3. 优先使用常见接口（eth0, eth1, ens3等）
+        4. 如果不确定，保守使用 eth0
+      recommended_strategy: "AUTO_DETECT_INTERFACE"
+      auto_repair_safe: true
+      required_context: ["current_interface", "available_interfaces"]
+
+    operator_not_supported:
+      description: "算子不支持"
+      severity: "high"
+      agent_guidance: |
+        分析要点:
+        1. 确认是哪个算子不支持
+        2. 判断该算子是否为必需（核心算子 vs 优化算子）
+        3. 如果是优化算子（如 fuse_*），建议注释掉
+        4. 如果是核心算子，标记为不可修复
+      recommended_strategy: "COMMENT_OUT_OPERATOR"
+      auto_repair_safe: false
+      required_context: ["operator_name", "operator_type"]
+      escalation_required: true
+
+    runtime_error:
+      description: "运行时错误（段错误、断言失败等）"
+      severity: "critical"
+      agent_guidance: |
+        分析要点:
+        1. 这类错误通常与配置无关
+        2. 可能是环境、依赖或代码 bug
+        3. 不建议自动修复
+        4. 必须向上层返回完整错误信息
+      recommended_strategy: "CANNOT_FIX"
+      auto_repair_safe: false
+      escalation_required: true
+      manual_intervention: true
+
+    unknown:
+      description: "未知错误类型"
+      severity: "unknown"
+      agent_guidance: |
+        分析要点:
+        1. 错误模式不匹配已知类型
+        2. 需要人工分析错误日志
+        3. 不得执行任何自动修复
+      recommended_strategy: "CANNOT_FIX"
+      auto_repair_safe: false
+      escalation_required: true
+
+  # 12.2 修复策略定义
+  repair_strategies:
+    FROM_REFERENCE:
+      description: "从参考配置补全缺失参数"
+      applicable_errors: ["missing_parameter", "invalid_config"]
+      safety_level: "high"
+      execution_logic: |
+        1. 从 error_info 提取缺失的参数名
+        2. 从 reference_config 获取该参数的默认值
+        3. 添加到配置中
+      agent_decision_factors:
+        - 参数是否为必需字段
+        - reference_value 是否与当前模型兼容
+        - 是否存在 model_specific 覆盖值
+
+    USE_DEFAULT:
+      description: "使用默认值修复无效配置"
+      applicable_errors: ["invalid_config"]
+      safety_level: "high"
+      execution_logic: |
+        1. 识别无效的配置参数
+        2. 使用 reference_config 中的合法值替换
+      agent_decision_factors:
+        - 原值为什么无效
+        - 默认值是否适合当前场景
+
+    REDUCE_BATCH_SIZE:
+      description: "减小 batch size 或增加梯度累积"
+      applicable_errors: ["out_of_memory"]
+      safety_level: "medium"
+      execution_logic: |
+        1. 如果 batch_size > 1，减半
+        2. 如果 batch_size = 1，加倍 accumulation_steps
+        3. 可选：启用/增强梯度检查点
+      agent_decision_factors:
+        - 当前 batch_size 值
+        - 当前 accumulation_steps 值
+        - 有效 batch size 变化是否合理
+        - 是否会影响收敛
+
+    INCREASE_TIMEOUT:
+      description: "增加通信超时时间"
+      applicable_errors: ["communication_timeout"]
+      safety_level: "high"
+      execution_logic: |
+        1. 获取当前 bkcl_timeout 值
+        2. 新值 = min(当前值 × 2, 5000)
+      agent_decision_factors:
+        - 当前超时值
+        - 是否已经接近最大值
+        - 超时是否由网络问题导致（需要人工介入）
+
+    AUTO_DETECT_INTERFACE:
+      description: "自动检测并设置网络接口"
+      applicable_errors: ["network_interface"]
+      safety_level: "high"
+      execution_logic: |
+        1. 检测系统可用网络接口
+        2. 选择第一个非 lo 接口
+        3. 如果没有检测到，使用 eth0
+      agent_decision_factors:
+        - 可用接口列表
+        - 当前配置值是否已正确
+
+    COMMENT_OUT_OPERATOR:
+      description: "注释掉不支持的算子配置"
+      applicable_errors: ["operator_not_supported"]
+      safety_level: "low"
+      execution_logic: |
+        1. 识别不支持的算子字段
+        2. 在配置中添加注释标记
+      agent_decision_factors:
+        - 算子是否为必需核心算子
+        - 注释后是否影响模型功能
+        - 是否有替代方案
+      warning: "此策略可能改变模型行为，需谨慎决策"
+
+    CANNOT_FIX:
+      description: "无法自动修复"
+      applicable_errors: ["operator_not_supported", "runtime_error", "unknown"]
+      safety_level: "n/a"
+      execution_logic: |
+        不执行任何修复操作，必须向上层返回错误信息
+      agent_decision_factors:
+        - 错误是否属于可修复类别
+        - 修复风险是否可接受
+        - 是否需要人工介入
+
+  # 12.3 修复决策流程（Agent 执行指导）
+  repair_decision_workflow:
+    step1_analyze_error:
+      description: "分析错误信号"
+      actions:
+        - "读取错误日志和检测到的错误信号"
+        - "识别错误类型和严重程度"
+        - "提取关键参数（如缺失的参数名）"
+
+    step2_assess_repairability:
+      description: "评估可修复性"
+      actions:
+        - "检查错误类型是否在可修复列表中"
+        - "评估当前修复尝试次数"
+        - "判断修复成功概率"
+      decision_points:
+        - question: "是否达到最大修复次数？"
+          if_yes: "直接返回不可修复"
+        - question: "错误类型是否属于 CANNOT_FIX？"
+          if_yes: "返回不可修复，上抛错误"
+
+    step3_select_strategy:
+      description: "选择修复策略"
+      actions:
+        - "参考 recommended_strategy 作为建议"
+        - "结合当前上下文判断策略适用性"
+        - "如果选择 COMMENT_OUT_OPERATOR，需额外评估风险"
+
+    step4_generate_repair_plan:
+      description: "生成修复计划"
+      output_format:
+        should_repair: "布尔值，是否执行修复"
+        strategy: "选择的策略名"
+        config_changes: "需要修改的配置项字典"
+        comment_out_fields: "需要注释的字段列表"
+        reasoning: "决策理由说明"
+        confidence: "high/medium/low"
+
+    step5_validate_and_execute:
+      description: "验证并执行修复"
+      actions:
+        - "调用 validate_repair_plan() 验证计划合法性"
+        - "如果验证通过，调用 apply_repair() 执行"
+        - "记录修复日志"
+
+  # 12.4 不可修复错误的显式暴露规则
+  unrepairable_errors:
+    explicit_exposure_required:
+      - error_type: "runtime_error"
+        reason: "通常与配置无关，可能涉及环境或代码 bug"
+        action: "完整返回错误日志，不得修改"
+
+      - error_type: "operator_not_supported"
+        condition: "核心算子不支持"
+        reason: "核心算子缺失会导致模型无法运行"
+        action: "返回错误并建议人工介入"
+
+      - error_type: "unknown"
+        reason: "未知错误需要人工分析"
+        action: "返回完整错误信息"
+
+    exposure_format:
+      status: "not_repaired"
+      error_type: "错误类型"
+      error_message: "原始错误信息"
+      reason: "为什么无法自动修复"
+      recommendation: "建议的人工处理步骤"
+
+  # 12.5 修复安全约束
+  safety_constraints:
+    max_repair_attempts: 3
+    forbidden_operations:
+      - "删除配置文件"
+      - "修改模型权重文件"
+      - "执行系统命令"
+      - "修改环境变量"
+    required_backup: true
+    rollback_on_failure: true
