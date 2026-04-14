@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """
-错误检测与自修复处理器 (Agent 驱动版)
+Error Handler - Agent驱动的错误检测与修复模块
 
-此脚本为 Agent 提供错误检测与修复的基础能力。
-复杂的修复决策逻辑由 AI 根据 SKILL.md 中的规则自主实现。
+从"代码驱动"重构为"Agent驱动"架构:
+- Skill提供错误信号检测和上下文信息
+- Agent基于上下文推理决策修复策略
+- 显式暴露不可修复错误，不静默处理
 """
 
 import os
 import re
-import yaml
-import time
 import shutil
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
-from datetime import datetime
-from enum import Enum
+from typing import Dict, List, Optional, Any, Tuple
+from dataclasses import dataclass, field
+from enum import Enum, auto
 
 
 class ErrorType(Enum):
-    """错误类型枚举 - 作为信号供 Agent 参考"""
+    """错误类型枚举"""
+    UNKNOWN = "unknown"
     MISSING_PARAMETER = "missing_parameter"
     INVALID_CONFIG = "invalid_config"
     OUT_OF_MEMORY = "out_of_memory"
@@ -26,648 +26,565 @@ class ErrorType(Enum):
     NETWORK_INTERFACE = "network_interface"
     OPERATOR_NOT_SUPPORTED = "operator_not_supported"
     RUNTIME_ERROR = "runtime_error"
-    UNKNOWN = "unknown"
 
 
 class RepairStrategy(Enum):
-    """修复策略枚举 - 供 Agent 选择"""
-    FROM_REFERENCE = "from_reference"
-    USE_DEFAULT = "use_default"
-    REDUCE_BATCH_SIZE = "reduce_batch_size"
-    INCREASE_TIMEOUT = "increase_timeout"
-    AUTO_DETECT_INTERFACE = "auto_detect_interface"
-    COMMENT_OUT_OPERATOR = "comment_out_operator"
-    CANNOT_FIX = "cannot_fix"
+    """修复策略枚举"""
+    FROM_REFERENCE = "from_reference"           # 从参考配置获取
+    USE_DEFAULT = "use_default"                 # 使用默认值
+    REDUCE_BATCH_SIZE = "reduce_batch_size"     # 减小batch size
+    INCREASE_TIMEOUT = "increase_timeout"       # 增加超时
+    AUTO_DETECT_INTERFACE = "auto_detect"       # 自动检测接口
+    COMMENT_OUT_OPERATOR = "comment_out"        # 注释掉算子
+    CANNOT_FIX = "cannot_fix"                   # 无法修复
+
+
+@dataclass
+class ErrorInfo:
+    """错误信息数据结构"""
+    error_type: ErrorType
+    error_message: str
+    repairable: bool
+    confidence: float = 0.8
+    extracted_params: Dict[str, Any] = field(default_factory=dict)
+    suggested_strategy: Optional[RepairStrategy] = None
+    context: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RepairContext:
+    """修复决策上下文"""
+    error_info: ErrorInfo
+    current_config: Dict[str, Any]
+    repair_attempt_count: int
+    max_repair_attempts: int
+    reference_values: Dict[str, Any]
+    available_actions: List[RepairStrategy]
 
 
 class ErrorHandler:
-    """错误处理器 - Agent 驱动版
-
-    设计原则:
-    1. Skill 提供错误检测信号和修复执行能力
-    2. Agent 基于上下文进行修复决策
-    3. 不可修复的错误必须显式返回，不得静默处理
     """
-
-    # 错误模式定义 - 仅作为检测信号，不直接决定修复策略
+    错误处理器 - Agent驱动架构
+    
+    职责分离:
+    - Skill层: 错误信号检测、上下文组装、修复执行
+    - Agent层: 推理决策(在调用方实现)
+    """
+    
+    # 错误检测模式
     ERROR_PATTERNS = {
-        ErrorType.MISSING_PARAMETER: [
-            re.compile(r"KeyError:\s*['\"](\w+)['\"]"),
-            re.compile(r"missing\s+required\s+parameter\s*['\"]?(\w+)['\"]?"),
-            re.compile(r"['\"](\w+)['\"]\s+is\s+required"),
-            re.compile(r"config\s+key\s+['\"](\w+)['\"]\s+not\s+found"),
-        ],
-        ErrorType.INVALID_CONFIG: [
-            re.compile(r"Invalid\s+.*device\s+specification"),
-            re.compile(r"Invalid\s+value\s+for\s+['\"]?(\w+)['\"]?"),
-            re.compile(r"['\"]?(\w+)['\"]?\s+must\s+be"),
-            re.compile(r"config\s+error:\s*(.+)", re.IGNORECASE),
-        ],
         ErrorType.OUT_OF_MEMORY: [
-            re.compile(r"XPU\s+OOM", re.IGNORECASE),
             re.compile(r"out\s+of\s+memory", re.IGNORECASE),
+            re.compile(r"XPU\s+OOM", re.IGNORECASE),
+            re.compile(r"allocate\s+memory\s+failed", re.IGNORECASE),
             re.compile(r"memory\s+allocation\s+failed", re.IGNORECASE),
-            re.compile(r"insufficient\s+memory", re.IGNORECASE),
-            re.compile(r"cannot\s+allocate\s+memory", re.IGNORECASE),
         ],
         ErrorType.COMMUNICATION_TIMEOUT: [
-            re.compile(r"BKCL.*timeout", re.IGNORECASE),
-            re.compile(r"BKCL\s+error.*timeout", re.IGNORECASE),
-            re.compile(r"communication.*timeout", re.IGNORECASE),
-            re.compile(r"timeout\s+waiting\s+for", re.IGNORECASE),
+            re.compile(r"BKCL\s+error", re.IGNORECASE),
+            re.compile(r"NCCL\s+error", re.IGNORECASE),
+            re.compile(r"communication\s+timeout", re.IGNORECASE),
+            re.compile(r"socket\s+timeout", re.IGNORECASE),
+        ],
+        ErrorType.MISSING_PARAMETER: [
+            re.compile(r"KeyError[:\s]+['\"](\w+)['\"]"),
+            re.compile(r"missing\s+required\s+parameter[:\s]+(\w+)", re.IGNORECASE),
+            re.compile(r"config\s+key\s+['\"](\w+)['\"]\s+not\s+found", re.IGNORECASE),
+        ],
+        ErrorType.INVALID_CONFIG: [
+            re.compile(r"invalid\s+config", re.IGNORECASE),
+            re.compile(r"invalid\s+value\s+for\s+(\w+)", re.IGNORECASE),
+            re.compile(r"No\s+such\s+file\s+or\s+directory"),
         ],
         ErrorType.NETWORK_INTERFACE: [
-            re.compile(r"BKCL.*socket.*ifname", re.IGNORECASE),
-            re.compile(r"network\s+interface.*not\s+found", re.IGNORECASE),
-            re.compile(r"cannot\s+find\s+network\s+interface", re.IGNORECASE),
-            re.compile(r"BKCL_SOCKET_IFNAME", re.IGNORECASE),
+            re.compile(r"network\s+interface", re.IGNORECASE),
+            re.compile(r"socket\s+ifname", re.IGNORECASE),
+            re.compile(r"cannot\s+bind\s+to\s+interface", re.IGNORECASE),
         ],
         ErrorType.OPERATOR_NOT_SUPPORTED: [
-            re.compile(r"operator.*not\s+supported", re.IGNORECASE),
-            re.compile(r"op.*not\s+implemented", re.IGNORECASE),
-            re.compile(r"kernel.*not\s+found", re.IGNORECASE),
-            re.compile(r"XPU\s+does\s+not\s+support", re.IGNORECASE),
+            re.compile(r"not\s+supported", re.IGNORECASE),
+            re.compile(r"Op\s+not\s+implemented", re.IGNORECASE),
+            re.compile(r"kernel\s+not\s+found", re.IGNORECASE),
         ],
         ErrorType.RUNTIME_ERROR: [
-            re.compile(r"Segmentation\s+fault", re.IGNORECASE),
             re.compile(r"RuntimeError"),
+            re.compile(r"Segmentation\s+fault", re.IGNORECASE),
             re.compile(r"AssertionError"),
-            re.compile(r"Floating\s+point\s+exception", re.IGNORECASE),
+            re.compile(r"CUDA\s+error", re.IGNORECASE),
+            re.compile(r"XPU\s+error", re.IGNORECASE),
         ],
     }
-
-    def __init__(
-        self,
-        reference_config_path: str = None,
-        repair_log_path: str = None,
-        mapping_rules_path: str = None
-    ):
-        """初始化错误处理器
-
+    
+    # 训练启动成功检测 - 移除简单的loss正则，改用语义判断
+    # 仅保留明确的训练启动指示器
+    TRAINING_START_PATTERNS = [
+        re.compile(r"Starting\s+training", re.IGNORECASE),
+        re.compile(r"Begin\s+training", re.IGNORECASE),
+    ]
+    
+    def __init__(self, reference_config_path: str = None):
+        """
+        初始化错误处理器
+        
         Args:
             reference_config_path: 参考配置文件路径
-            repair_log_path: 修复日志文件路径
-            mapping_rules_path: 映射规则文件路径（包含错误处理规则）
         """
-        # 参考配置路径
-        if reference_config_path is None:
-            reference_config_path = os.path.join(
-                os.path.dirname(__file__),
-                '..',
-                'reference_configs',
-                'xpu_reference.yaml'
-            )
-        self.reference_config_path = reference_config_path
-        self.reference_config = self._load_reference_config()
-
-        # 修复日志路径
-        if repair_log_path is None:
-            repair_log_path = os.path.join(
-                os.path.dirname(__file__),
-                '..',
-                'repair_log.txt'
-            )
-        self.repair_log_path = repair_log_path
-
-        # 映射规则路径（包含错误处理规则）
-        if mapping_rules_path is None:
-            mapping_rules_path = os.path.join(
-                os.path.dirname(__file__),
-                '..',
-                'templates',
-                'mapping_rules.yaml'
-            )
-        self.mapping_rules_path = mapping_rules_path
-        self.error_rules = self._load_error_rules()
-
-        # 修复计数
-        self.repair_count = 0
-        self.max_repair_attempts = 3
-
-    def _load_reference_config(self) -> Dict:
-        """加载参考配置"""
-        try:
-            with open(self.reference_config_path, 'r', encoding='utf-8') as f:
-                return yaml.safe_load(f) or {}
-        except Exception as e:
-            print(f"警告: 无法加载参考配置: {e}")
-            return {}
-
-    def _load_error_rules(self) -> Dict:
-        """加载错误处理规则"""
-        try:
-            with open(self.mapping_rules_path, 'r', encoding='utf-8') as f:
-                rules = yaml.safe_load(f) or {}
-                return rules.get('error_handling', {})
-        except Exception as e:
-            print(f"警告: 无法加载错误处理规则: {e}")
-            return {}
-
-    def detect_error_signals(self, log_content: str) -> Dict[str, Any]:
-        """检测错误信号 - 为 Agent 提供初步分析
-
+        self.reference_config_path = reference_config_path or self._get_default_reference_path()
+        self.repair_history: List[Dict[str, Any]] = []
+        
+    def _get_default_reference_path(self) -> str:
+        """获取默认参考配置路径"""
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(script_dir, '..', 'reference_configs', 'xpu_reference.yaml')
+    
+    def detect_error_signals(self, log_content: str) -> List[Dict[str, Any]]:
+        """
+        检测错误信号
+        
         Args:
-            log_content: 错误日志内容
-
+            log_content: 日志内容
+            
         Returns:
-            错误信号检测结果，供 Agent 进一步分析
+            检测到的错误信号列表
         """
         signals = []
-
-        # 检查每种错误类型的匹配模式
+        
         for error_type, patterns in self.ERROR_PATTERNS.items():
             for pattern in patterns:
-                matches = pattern.finditer(log_content)
-                for match in matches:
+                match = pattern.search(log_content)
+                if match:
                     signal = {
-                        "error_type": error_type.value,
-                        "matched_pattern": pattern.pattern,
-                        "matched_text": match.group(0),
-                        "position": match.span(),
-                        "extracted_params": list(match.groups()) if match.groups() else [],
+                        "error_type": error_type,
+                        "pattern": pattern.pattern[:50],
+                        "matched_text": match.group()[:100],
+                        "extracted_params": match.groups() if match.groups() else [],
                     }
                     signals.append(signal)
-
-        # 去重并按位置排序
-        seen = set()
-        unique_signals = []
-        for s in signals:
-            key = (s["error_type"], s["position"][0])
-            if key not in seen:
-                seen.add(key)
-                unique_signals.append(s)
-
-        unique_signals.sort(key=lambda x: x["position"][0])
-
-        return {
-            "signals_detected": len(unique_signals) > 0,
-            "signals": unique_signals,
-            "log_snippet": log_content[-2000:] if len(log_content) > 2000 else log_content,
+                    break  # 每种错误类型只记录一次
+        
+        return signals
+    
+    def analyze_error(self, log_content: str) -> ErrorInfo:
+        """
+        分析错误日志，生成错误信息
+        
+        Args:
+            log_content: 日志内容
+            
+        Returns:
+            错误信息结构
+        """
+        signals = self.detect_error_signals(log_content)
+        
+        if not signals:
+            return ErrorInfo(
+                error_type=ErrorType.UNKNOWN,
+                error_message="未检测到已知错误模式",
+                repairable=False,
+                confidence=0.5,
+            )
+        
+        # 取第一个检测到的信号（优先级最高）
+        primary_signal = signals[0]
+        error_type = primary_signal["error_type"]
+        
+        # 判断可修复性
+        repairable, strategy = self._assess_repairability(error_type, signals)
+        
+        # 构建错误消息
+        error_msg = f"{error_type.value}: {primary_signal['matched_text']}"
+        
+        return ErrorInfo(
+            error_type=error_type,
+            error_message=error_msg,
+            repairable=repairable,
+            confidence=0.85 if len(signals) > 0 else 0.6,
+            extracted_params={"signals": signals},
+            suggested_strategy=strategy,
+            context={"signal_count": len(signals)}
+        )
+    
+    def _assess_repairability(self, error_type: ErrorType, signals: List[Dict]) -> Tuple[bool, RepairStrategy]:
+        """
+        评估错误可修复性（Skill层初步评估）
+        
+        Args:
+            error_type: 错误类型
+            signals: 错误信号列表
+            
+        Returns:
+            (是否可修复, 建议策略)
+        """
+        # 可修复错误映射
+        repairable_map = {
+            ErrorType.MISSING_PARAMETER: (True, RepairStrategy.FROM_REFERENCE),
+            ErrorType.INVALID_CONFIG: (True, RepairStrategy.USE_DEFAULT),
+            ErrorType.OUT_OF_MEMORY: (True, RepairStrategy.REDUCE_BATCH_SIZE),
+            ErrorType.COMMUNICATION_TIMEOUT: (True, RepairStrategy.INCREASE_TIMEOUT),
+            ErrorType.NETWORK_INTERFACE: (True, RepairStrategy.AUTO_DETECT_INTERFACE),
+            ErrorType.OPERATOR_NOT_SUPPORTED: (True, RepairStrategy.COMMENT_OUT_OPERATOR),
+            # 不可修复错误
+            ErrorType.RUNTIME_ERROR: (False, RepairStrategy.CANNOT_FIX),
+            ErrorType.UNKNOWN: (False, RepairStrategy.CANNOT_FIX),
         }
-
+        
+        return repairable_map.get(error_type, (False, RepairStrategy.CANNOT_FIX))
+    
     def get_error_context(
         self,
         log_content: str,
-        config_path: str = None,
-        model_name: str = None
+        config_path: str,
+        model_name: str,
+        repair_attempt: int = 0,
+        max_attempts: int = 3
     ) -> Dict[str, Any]:
-        """获取错误处理的完整上下文信息，供 Agent 执行修复决策
-
-        这是 Agent 驱动模式的核心方法，提供所有必要的信息和规则，
-        由 Agent 基于 SKILL.md 指导完成实际的错误分析与修复决策。
-
-        Args:
-            log_content: 错误日志内容
-            config_path: 配置文件路径（可选）
-            model_name: 模型名称（可选）
-
-        Returns:
-            完整的错误处理上下文
         """
-        # 1. 检测错误信号
-        error_signals = self.detect_error_signals(log_content)
-
-        # 2. 加载当前配置（如果提供）
-        current_config = {}
-        if config_path and os.path.exists(config_path):
-            try:
-                with open(config_path, 'r', encoding='utf-8') as f:
-                    current_config = yaml.safe_load(f) or {}
-            except Exception as e:
-                current_config = {"_load_error": str(e)}
-
-        # 3. 提取关键配置参数
-        config_params = self._extract_relevant_params(current_config)
-
-        # 4. 构建上下文
+        获取错误处理完整上下文（供Agent使用）
+        
+        Args:
+            log_content: 日志内容
+            config_path: 配置文件路径
+            model_name: 模型名称
+            repair_attempt: 当前修复尝试次数
+            max_attempts: 最大修复尝试次数
+            
+        Returns:
+            完整上下文信息
+        """
+        error_info = self.analyze_error(log_content)
+        current_config = self._load_config(config_path) if os.path.exists(config_path) else {}
+        reference_config = self._load_reference_config()
+        
+        # 提取相关配置参数
+        relevant_params = self._extract_relevant_params(error_info, current_config)
+        
         context = {
-            "error_detection": error_signals,
+            "error_detection": {
+                "signals_detected": error_info.error_type != ErrorType.UNKNOWN,
+                "error_info": {
+                    "type": error_info.error_type.value,
+                    "message": error_info.error_message,
+                    "repairable": error_info.repairable,
+                    "confidence": error_info.confidence,
+                    "extracted_params": error_info.extracted_params,
+                    "suggested_strategy": error_info.suggested_strategy.value if error_info.suggested_strategy else None,
+                },
+                "log_snippet": log_content[-2000:] if len(log_content) > 2000 else log_content,
+            },
             "current_state": {
                 "config_path": config_path,
                 "model_name": model_name,
                 "current_config": current_config,
-                "relevant_params": config_params,
-                "repair_attempt_count": self.repair_count,
-                "max_repair_attempts": self.max_repair_attempts,
+                "relevant_params": relevant_params,
+                "repair_attempt_count": repair_attempt,
+                "max_repair_attempts": max_attempts,
             },
-            "rules": {
-                "error_patterns": {
-                    k.value: [p.pattern for p in v]
-                    for k, v in self.ERROR_PATTERNS.items()
-                },
-                "error_handling_rules": self.error_rules,
-                "reference_config_keys": list(self.reference_config.keys()),
-            },
-            "available_repair_actions": {
-                "FROM_REFERENCE": "从参考配置补全缺失参数",
-                "USE_DEFAULT": "使用默认值修复无效配置",
-                "REDUCE_BATCH_SIZE": "减小 batch size 或增加梯度累积",
-                "INCREASE_TIMEOUT": "增加通信超时时间",
-                "AUTO_DETECT_INTERFACE": "自动检测网络接口",
-                "COMMENT_OUT_OPERATOR": "注释掉不支持的算子",
-                "CANNOT_FIX": "无法自动修复，需要人工介入",
-            },
-            "reference_values": self._get_relevant_reference_values(
-                error_signals, config_params
-            ),
+            "reference_values": reference_config,
+            "available_repair_actions": [s.value for s in RepairStrategy],
         }
-
+        
         return context
-
-    def _extract_relevant_params(self, config: Dict) -> Dict[str, Any]:
-        """提取与错误修复相关的配置参数"""
-        relevant_keys = [
-            "device",
-            "per_device_train_batch_size",
-            "gradient_accumulation_steps",
-            "bkcl_timeout",
-            "bkcl_socket_ifname",
-            "recompute_granularity",
-            "max_seq_len",
-            "output_dir",
-            "model_name_or_path",
-        ]
-        return {k: config.get(k) for k in relevant_keys if k in config}
-
-    def _get_relevant_reference_values(
-        self,
-        error_signals: Dict,
-        config_params: Dict
-    ) -> Dict[str, Any]:
-        """获取与当前错误相关的参考值"""
+    
+    def _extract_relevant_params(self, error_info: ErrorInfo, config: Dict) -> Dict[str, Any]:
+        """提取与错误相关的配置参数"""
         relevant = {}
-
-        # 根据错误信号决定需要哪些参考值
-        signals = error_signals.get("signals", [])
-        error_types = {s["error_type"] for s in signals}
-
-        if "missing_parameter" in error_types:
-            # 提供常用必需字段的参考值
-            relevant["default_required_fields"] = {
-                "device": self.reference_config.get("device", "xpu"),
-                "bkcl_timeout": self.reference_config.get("bkcl_timeout", 1000),
-                "bkcl_socket_ifname": self.reference_config.get("bkcl_socket_ifname", "eth0"),
-            }
-
-        if "out_of_memory" in error_types:
-            # 提供内存优化相关的参考值
-            relevant["memory_optimization"] = {
-                "per_device_train_batch_size": 1,
-                "gradient_accumulation_steps": self.reference_config.get(
-                    "gradient_accumulation_steps", 8
-                ),
-                "recompute_granularity": "full",
-            }
-
-        if "communication_timeout" in error_types:
-            # 提供通信相关的参考值
-            relevant["communication"] = {
-                "bkcl_timeout": min(
-                    config_params.get("bkcl_timeout", 1000) * 2,
-                    5000
-                ),
-            }
-
+        
+        # 从错误信号中提取关键参数
+        signals = error_info.extracted_params.get("signals", [])
+        for signal in signals:
+            params = signal.get("extracted_params", [])
+            for param in params:
+                if isinstance(param, str) and param in config:
+                    relevant[param] = config[param]
+        
+        # 根据错误类型添加相关参数
+        if error_info.error_type == ErrorType.OUT_OF_MEMORY:
+            relevant.update({
+                "per_device_train_batch_size": config.get("per_device_train_batch_size", "N/A"),
+                "gradient_accumulation_steps": config.get("gradient_accumulation_steps", "N/A"),
+            })
+        elif error_info.error_type == ErrorType.COMMUNICATION_TIMEOUT:
+            relevant.update({
+                "bkcl_timeout": config.get("bkcl_timeout", "N/A"),
+            })
+        
         return relevant
-
-    def validate_repair_plan(self, repair_plan: Dict[str, Any]) -> Tuple[bool, str]:
-        """验证 Agent 生成的修复计划是否合法
-
-        Args:
-            repair_plan: Agent 生成的修复计划
-
-        Returns:
-            (是否合法, 错误信息)
-        """
-        if not isinstance(repair_plan, dict):
-            return False, "修复计划必须是字典类型"
-
-        # 检查必需的字段
-        if "should_repair" not in repair_plan:
-            return False, "修复计划必须包含 'should_repair' 字段"
-
-        # 如果不修复，不需要其他字段
-        if not repair_plan.get("should_repair"):
-            return True, ""
-
-        # 如果要修复，需要指定策略
-        if "strategy" not in repair_plan:
-            return False, "执行修复时必须指定 'strategy'"
-
-        # 验证策略是否合法
-        valid_strategies = [s.value for s in RepairStrategy]
-        if repair_plan["strategy"] not in valid_strategies:
-            return False, f"非法的策略: {repair_plan['strategy']}"
-
-        # 验证参数变更
-        changes = repair_plan.get("config_changes", {})
-        if not isinstance(changes, dict):
-            return False, "'config_changes' 必须是字典类型"
-
-        # 检查危险操作
-        dangerous_keys = ["rm ", "mv ", "system("]
-        for key, value in changes.items():
-            if isinstance(value, str):
-                for dangerous in dangerous_keys:
-                    if dangerous in value:
-                        return False, f"参数值包含危险操作: {key}={value}"
-
-        return True, ""
-
-    def apply_repair(
+    
+    def _load_config(self, config_path: str) -> Dict[str, Any]:
+        """加载YAML配置"""
+        try:
+            import yaml
+            with open(config_path, 'r', encoding='utf-8') as f:
+                return yaml.safe_load(f) or {}
+        except Exception as e:
+            return {"_load_error": str(e)}
+    
+    def _load_reference_config(self) -> Dict[str, Any]:
+        """加载参考配置"""
+        return self._load_config(self.reference_config_path)
+    
+    def execute_repair(
         self,
         config_path: str,
-        repair_plan: Dict[str, Any],
-        error_context: Dict[str, Any]
+        strategy: RepairStrategy,
+        changes: Dict[str, Any],
+        comment_out_fields: List[str] = None
     ) -> Tuple[bool, str, Dict[str, Any]]:
-        """执行 Agent 决策的修复计划
-
+        """
+        执行修复（Skill层执行Agent决策）
+        
         Args:
             config_path: 配置文件路径
-            repair_plan: Agent 生成的修复计划
-            error_context: 错误上下文（用于日志记录）
-
+            strategy: 修复策略
+            changes: 配置修改
+            comment_out_fields: 需要注释掉的字段
+            
         Returns:
-            (是否修复成功, 修复后的配置文件路径, 修复详情)
+            (是否成功, 新配置路径, 详细信息)
         """
-        # 1. 验证修复计划
-        valid, error_msg = self.validate_repair_plan(repair_plan)
-        if not valid:
-            return False, config_path, {
-                "error": f"修复计划验证失败: {error_msg}",
-                "repair_plan": repair_plan,
-            }
-
-        # 2. 检查是否应该修复
-        if not repair_plan.get("should_repair", False):
-            reason = repair_plan.get("reason", "Agent 判断不应执行修复")
-            return False, config_path, {
-                "status": "not_repaired",
-                "reason": reason,
-                "error": reason,
-            }
-
-        # 3. 检查修复次数限制
-        if self.repair_count >= self.max_repair_attempts:
-            return False, config_path, {
-                "error": "达到最大修复尝试次数",
-                "max_attempts": self.max_repair_attempts,
-            }
-
-        self.repair_count += 1
-
-        # 4. 加载当前配置
+        comment_out_fields = comment_out_fields or []
+        
         try:
+            # 读取原配置
             with open(config_path, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f) or {}
-        except Exception as e:
-            return False, config_path, {"error": f"无法加载配置: {e}"}
-
-        # 5. 执行配置变更
-        strategy = repair_plan.get("strategy")
-        config_changes = repair_plan.get("config_changes", {})
-        comment_out_fields = repair_plan.get("comment_out_fields", [])
-
-        changes_made = []
-        backup_path = None
-
-        try:
-            # 应用配置变更
-            for key, value in config_changes.items():
-                old_value = config.get(key, "<missing>")
-                config[key] = value
-                changes_made.append(f"{key}: {old_value} -> {value}")
-
-            # 处理需要注释掉的字段（通过特殊标记）
-            if comment_out_fields:
-                config["_commented_out_by_repair"] = comment_out_fields
-                changes_made.append(f"注释字段: {comment_out_fields}")
-
-            # 6. 备份原配置
-            backup_path = self._backup_config(config_path)
-
-            # 7. 保存修复后的配置
-            with open(config_path, 'w', encoding='utf-8') as f:
-                yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
-
-            # 8. 记录修复日志
-            repair_details = {
-                "attempt": self.repair_count,
-                "strategy": strategy,
-                "changes": changes_made,
+                original_lines = f.readlines()
+            
+            # 创建备份
+            backup_path = f"{config_path}.backup.{self._timestamp()}"
+            shutil.copy2(config_path, backup_path)
+            
+            # 应用修改
+            modified_lines = self._apply_changes(
+                original_lines, changes, comment_out_fields
+            )
+            
+            # 保存新配置
+            new_config_path = config_path
+            with open(new_config_path, 'w', encoding='utf-8') as f:
+                f.writelines(modified_lines)
+            
+            # 记录修复历史
+            repair_record = {
+                "timestamp": self._timestamp(),
+                "strategy": strategy.value,
+                "changes": changes,
+                "comment_out_fields": comment_out_fields,
                 "backup_path": backup_path,
-                "agent_reasoning": repair_plan.get("reasoning", ""),
-                "confidence": repair_plan.get("confidence", "unknown"),
+                "config_path": new_config_path,
             }
-            self._log_repair_with_context(config_path, error_context, repair_details)
-
-            return True, config_path, repair_details
-
+            self.repair_history.append(repair_record)
+            
+            details = {
+                "changes": changes,
+                "comment_out_fields": comment_out_fields,
+                "backup_path": backup_path,
+                "repair_record": repair_record,
+            }
+            
+            return True, new_config_path, details
+            
         except Exception as e:
-            # 如果保存失败，尝试恢复备份
-            if backup_path and os.path.exists(backup_path):
-                try:
-                    shutil.copy2(backup_path, config_path)
-                except Exception:
-                    pass
-
-            return False, config_path, {
-                "error": f"执行修复时出错: {str(e)}",
-                "changes_attempted": changes_made,
-            }
-
-    def _backup_config(self, config_path: str) -> str:
-        """备份配置文件"""
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        backup_path = f"{config_path}.backup.{timestamp}"
-        shutil.copy2(config_path, backup_path)
-        return backup_path
-
-    def _log_repair_with_context(
+            return False, config_path, {"error": str(e)}
+    
+    def _apply_changes(
         self,
-        config_path: str,
-        error_context: Dict[str, Any],
-        repair_details: Dict[str, Any]
-    ):
-        """记录修复日志（包含上下文）"""
-        error_signals = error_context.get("error_detection", {})
-        signals = error_signals.get("signals", [])
-
-        log_entry = f"""
-{'='*60}
-修复时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-配置文件: {config_path}
-修复次数: {repair_details.get('attempt', 0)}
-
-错误信号:
-"""
-        for signal in signals:
-            log_entry += f"  - 类型: {signal['error_type']}\n"
-            log_entry += f"    匹配: {signal['matched_text']}\n"
-
-        log_entry += f"""
-修复策略: {repair_details.get('strategy', 'unknown')}
-Agent 推理: {repair_details.get('agent_reasoning', 'N/A')}
-置信度: {repair_details.get('confidence', 'unknown')}
-
-修改内容:
-"""
-        for change in repair_details.get("changes", []):
-            log_entry += f"  - {change}\n"
-
-        log_entry += f"备份路径: {repair_details.get('backup_path', 'N/A')}\n"
-        log_entry += f"{'='*60}\n"
-
-        with open(self.repair_log_path, 'a', encoding='utf-8') as f:
-            f.write(log_entry)
-
-    def monitor_training(
-        self,
-        log_file: str,
-        timeout: int = 300
-    ) -> Dict[str, Any]:
-        """监控训练日志，检测错误 - Agent 驱动模式
-
-        Args:
-            log_file: 日志文件路径
-            timeout: 超时时间（秒）
-
-        Returns:
-            监控结果字典，包含错误上下文供 Agent 分析
-        """
-        result = {
-            "status": "running",
-            "error_detected": False,
-            "error_context": None,
-            "log_content": "",
-        }
-
-        start_time = time.time()
-        last_position = 0
-
-        while time.time() - start_time < timeout:
-            if os.path.exists(log_file):
-                with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
-                    f.seek(last_position)
-                    new_content = f.read()
-                    last_position = f.tell()
-
-                    if new_content:
-                        result["log_content"] += new_content
-
-                        # 检测错误信号
-                        error_signals = self.detect_error_signals(new_content)
-
-                        if error_signals["signals_detected"]:
-                            result["status"] = "error_detected"
-                            result["error_detected"] = True
-                            result["error_context"] = error_signals
-                            return result
-
-                        # 检查训练是否成功启动
-                        if self._is_training_started(new_content):
-                            result["status"] = "success"
-                            return result
-
-            time.sleep(5)
-
-        result["status"] = "timeout"
+        lines: List[str],
+        changes: Dict[str, Any],
+        comment_out_fields: List[str]
+    ) -> List[str]:
+        """应用配置修改"""
+        result = []
+        modified_keys = set()
+        
+        for line in lines:
+            original_line = line
+            modified = False
+            
+            # 检查是否需要注释掉
+            for field in comment_out_fields:
+                if line.strip().startswith(f"{field}:"):
+                    line = f"# {line}"
+                    modified = True
+                    break
+            
+            # 检查是否需要修改值
+            if not modified:
+                for key, value in changes.items():
+                    if line.strip().startswith(f"{key}:"):
+                        # 保持缩进
+                        indent = len(line) - len(line.lstrip())
+                        line = " " * indent + f"{key}: {value}\n"
+                        modified_keys.add(key)
+                        modified = True
+                        break
+            
+            result.append(line)
+        
+        # 添加新增的配置项
+        for key, value in changes.items():
+            if key not in modified_keys:
+                result.append(f"{key}: {value}\n")
+        
         return result
-
-    def _is_training_started(self, log_content: str) -> bool:
-        """检查训练是否已开始"""
-        success_patterns = [
-            re.compile(r"loss:\s*\d+\.?\d*"),
-            re.compile(r"Step:\s*\d+"),
-            re.compile(r"global_step\s*[=:]\s*\d+"),
-            re.compile(r"Starting\s+training", re.IGNORECASE),
-            re.compile(r"Begin\s+training", re.IGNORECASE),
-        ]
-
-        for pattern in success_patterns:
+    
+    def _timestamp(self) -> str:
+        """生成时间戳"""
+        from datetime import datetime
+        return datetime.now().strftime('%Y%m%d_%H%M%S')
+    
+    def get_repair_suggestions(self, error_info: ErrorInfo) -> List[str]:
+        """
+        获取修复建议（供Agent或用户使用）
+        
+        Args:
+            error_info: 错误信息
+            
+        Returns:
+            建议列表
+        """
+        suggestions_map = {
+            ErrorType.MISSING_PARAMETER: [
+                "检查配置文件是否缺少必需字段",
+                "参考xpu_reference.yaml补全缺失参数",
+                "确认模型配置与训练任务匹配",
+            ],
+            ErrorType.INVALID_CONFIG: [
+                "检查配置参数值是否合法",
+                "确认文件路径存在且可访问",
+                "验证配置格式是否正确",
+            ],
+            ErrorType.OUT_OF_MEMORY: [
+                "减小per_device_train_batch_size",
+                "增大gradient_accumulation_steps",
+                "减少模型并行度",
+            ],
+            ErrorType.COMMUNICATION_TIMEOUT: [
+                "增加bkcl_timeout值",
+                "检查网络连接稳定性",
+                "确认BKCL配置正确",
+            ],
+            ErrorType.RUNTIME_ERROR: [
+                "检查Paddle/PaddleFormers版本兼容性",
+                "确认XPU驱动和环境配置正确",
+                "查看完整错误堆栈定位问题",
+            ],
+            ErrorType.OPERATOR_NOT_SUPPORTED: [
+                "注释掉不支持的算子配置",
+                "更新PaddleFormers到最新版本",
+                "联系XPU支持团队确认算子支持状态",
+            ],
+            ErrorType.UNKNOWN: [
+                "查看完整训练日志",
+                "检查环境配置",
+                "尝试手动复现问题",
+            ],
+        }
+        
+        return suggestions_map.get(error_info.error_type, ["未知错误，建议人工分析"])
+    
+    def is_training_started(self, log_content: str) -> bool:
+        """
+        检测训练是否已开始（基于上下文的语义判断）
+        
+        修改：不再依赖简单正则匹配loss，而是基于上下文判断是否是真实训练输出
+        
+        Args:
+            log_content: 日志内容
+            
+        Returns:
+            是否已检测到训练开始信号
+        """
+        lines = log_content.strip().split('\n') if log_content else []
+        
+        # 检查最近20行是否包含训练循环特征
+        has_step = False
+        has_number = False
+        has_training_kw = False
+        
+        for line in lines[-20:]:
+            line_lower = line.lower()
+            # 检测step指示器
+            if re.search(r'(step|iteration|batch)\s*[=:]?\s*\d+', line_lower):
+                has_step = True
+            # 检测数字（可能是loss）
+            if re.search(r'[\s:](\d+\.\d+)([,\s]|$)', line):
+                has_number = True
+            # 检测训练关键词
+            if any(kw in line_lower for kw in ['train', 'epoch', 'forward', 'backward']):
+                has_training_kw = True
+        
+        # 关键判断：同时有step和数字，或者有明确的训练启动指示
+        if has_step and has_number:
+            return True
+        
+        # 检查明确的训练启动指示
+        for pattern in self.TRAINING_START_PATTERNS:
             if pattern.search(log_content):
                 return True
-
+        
         return False
-
-    def should_attempt_repair(self, error_context: Dict[str, Any]) -> bool:
-        """判断是否应该尝试修复 - 提供给 Agent 的辅助方法
-
-        根据错误信号和当前状态，建议是否值得尝试修复。
-        最终决策权在 Agent。
-
-        Args:
-            error_context: 错误上下文
-
-        Returns:
-            是否建议尝试修复
-        """
-        # 检查修复次数
-        if self.repair_count >= self.max_repair_attempts:
-            return False
-
-        # 检查错误信号
-        error_signals = error_context.get("error_detection", {})
-        signals = error_signals.get("signals", [])
-
-        if not signals:
-            return False
-
-        # 检查是否有不可修复的错误类型
-        unrepairable_types = {
-            "runtime_error",
-            "operator_not_supported",
-            "unknown",
-        }
-
-        for signal in signals:
-            if signal["error_type"] in unrepairable_types:
-                return False
-
-        return True
+    
+    def get_repair_history(self) -> List[Dict[str, Any]]:
+        """获取修复历史"""
+        return self.repair_history
 
 
-def main():
-    """命令行入口 - Agent 驱动模式"""
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description='Error handler for XPU training (Agent-driven)'
-    )
-    parser.add_argument('--log-file', help='Path to training log file')
-    parser.add_argument('--config-file', help='Path to config file')
-    parser.add_argument('--model-name', help='Model name')
-    parser.add_argument(
-        '--get-context',
-        action='store_true',
-        help='Print error context for Agent analysis'
-    )
-
-    args = parser.parse_args()
-
+# 便捷函数
+def analyze_training_error(
+    log_content: str,
+    config_path: str = None,
+    model_name: str = "unknown"
+) -> Dict[str, Any]:
+    """
+    分析训练错误的便捷函数
+    
+    Args:
+        log_content: 错误日志内容
+        config_path: 配置文件路径
+        model_name: 模型名称
+        
+    Returns:
+        分析结果
+    """
     handler = ErrorHandler()
-
-    if args.get_context and args.log_file:
-        # 读取日志
-        with open(args.log_file, 'r', encoding='utf-8', errors='ignore') as f:
-            log_content = f.read()
-
-        # 获取错误上下文
-        context = handler.get_error_context(
-            log_content=log_content,
-            config_path=args.config_file,
-            model_name=args.model_name
-        )
-
-        print("# 错误处理上下文")
-        print(yaml.dump(context, default_flow_style=False, allow_unicode=True))
-
-    else:
-        print("Agent 驱动模式：请使用 --get-context 获取错误上下文")
-        print("示例：python error_handler.py --log-file train.log --config-file config.yaml --get-context")
-
-    return 0
+    error_info = handler.analyze_error(log_content)
+    
+    result = {
+        "error_type": error_info.error_type.value,
+        "error_message": error_info.error_message,
+        "repairable": error_info.repairable,
+        "confidence": error_info.confidence,
+        "suggested_strategy": error_info.suggested_strategy.value if error_info.suggested_strategy else None,
+        "suggestions": handler.get_repair_suggestions(error_info),
+    }
+    
+    if config_path:
+        context = handler.get_error_context(log_content, config_path, model_name)
+        result["context"] = context
+    
+    return result
 
 
-if __name__ == '__main__':
-    exit(main())
+if __name__ == "__main__":
+    # 测试代码
+    import sys
+    
+    if len(sys.argv) < 2:
+        print("Usage: python error_handler.py <log_file> [config_file]")
+        sys.exit(1)
+    
+    log_file = sys.argv[1]
+    config_file = sys.argv[2] if len(sys.argv) > 2 else None
+    
+    with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
+        log_content = f.read()
+    
+    result = analyze_training_error(log_content, config_file)
+    
+    print("\n错误分析结果:")
+    print(f"  类型: {result['error_type']}")
+    print(f"  消息: {result['error_message']}")
+    print(f"  可修复: {result['repairable']}")
+    print(f"  建议策略: {result['suggested_strategy']}")
+    print("\n修复建议:")
+    for suggestion in result['suggestions']:
+        print(f"  - {suggestion}")

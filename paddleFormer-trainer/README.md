@@ -35,16 +35,23 @@
 
 ### 3. 启动脚本生成
 - 基于模板自动生成 XPU 训练启动脚本
+- **动态参数处理**: `FLAGS_trace_api` 和 `LD_LIBRARY_PATH` 基于环境动态生成
 - 自动填充模型路径、配置文件路径、设备列表等参数
 - 输出脚本已赋予执行权限
 
-### 4. 安全错误处理
+### 4. Agent 驱动的训练启动监控
+- **状态推理**: Agent 主动分析日志，推理判断训练状态
+- **准确判定**: 以首个 loss 输出作为训练真正开始的标志
+- **错误联动**: 与错误修复模块联动，检测错误自动触发修复
+- **动态决策**: 基于日志内容动态决策是否继续监控或终止
+
+### 5. 安全错误处理
 - **错误信号检测**: 正则匹配识别常见错误类型
 - **Agent 驱动修复**: 基于上下文分析决策是否修复及如何修复
 - **显式暴露原则**: 不可修复错误（如 RuntimeError）必须完整返回，不得静默处理
 - **安全保障**: 自动备份、失败回滚、最大 3 次修复尝试
 
-### 5. 统一输出管理
+### 6. 统一输出管理
 - 所有输出文件统一存放在 `output_dir` 下
 - 自动创建子目录：`checkpoints/`、`vdl_log/`、`dataset_cache/`、`paddleformers_dist_log/`
 
@@ -85,6 +92,11 @@
 └─────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────┐
+│  阶段4.5: Agent 驱动的训练启动监控                                  │
+│  └── 监控日志 → Agent 推理状态 → 判定成功/失败/超时                  │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
 │  阶段5: 错误检测与修复 (Agent 驱动)                                │
 │  └── 错误信号检测 → Agent 分析决策 → 修复执行/显式返回               │
 └─────────────────────────────────────────────────────────────────┘
@@ -103,6 +115,8 @@
 | `train_dataset_path` | string | 否 | 训练数据集路径。若未提供，默认使用 `"./datasets/train.jsonl"` |
 | `gpu_yaml_path` | string | 否 | 指定的 GPU YAML 配置文件路径。若未提供，Agent 将自动检索选择 |
 | `output_dir` | string | 否 | 训练输出根目录，默认 `"./output"` |
+| `python_env_path` | string | **是** | Python 虚拟环境路径，用于激活 Paddle/PaddleFormers |
+| `api_yaml_path` | string | 否 | API 追踪配置文件路径。若未提供，将在输出目录自动生成 |
 | `paddleformers_root` | string | 否 | PaddleFormers 仓库根目录。若未提供，将自动分层搜索 |
 | `allow_fallback` | boolean | 否 | 找不到 GPU YAML 时是否允许使用参考配置生成，默认 `false` |
 | `custom_params` | dict | 否 | 自定义参数，覆盖自动生成的配置值 |
@@ -136,6 +150,25 @@
 - **用途**: 指定所有训练输出文件的存放目录
 - **默认**: `"./output"`
 - **结构**: 将自动创建子目录 `checkpoints/`、`vdl_log/`、`dataset_cache/`、`paddleformers_dist_log/`
+
+#### `python_env_path`
+- **用途**: 指定 Python 虚拟环境路径，用于激活 Paddle/PaddleFormers 运行环境
+- **必填**: **是**，这是唯一需要用户显式指定的路径参数
+- **验证**: 脚本会自动检查 `${python_env_path}/bin/activate` 是否存在
+- **动态参数**: `LD_LIBRARY_PATH` 将基于该路径动态拼接生成
+- **示例**: `"/root/paddlejob/zhangxiao_dev/qwen_env"`, `"/workspace/paddle_env"`
+
+#### `api_yaml_path`
+- **用途**: 指定 API 追踪配置文件路径，用于配置需要追踪的 API 列表
+- **默认**: 若未提供，系统将在输出目录自动生成 `api.yaml`（初始化为 `apis:` 空列表）
+- **格式**: 标准 YAML 格式，包含需要追踪的 API 列表
+- **动态填充**: 系统可根据模型类型自动推荐需要追踪的 API，用户可后续手动编辑补充
+- **示例**:
+  ```yaml
+  apis:
+    - paddle.nn.functional.swiglu
+    - paddle.nn.functional.flash_attention
+  ```
 
 #### `allow_fallback`
 - **用途**: 控制找不到 GPU YAML 时的行为
@@ -315,6 +348,110 @@ config_path, _ = generator.save_xpu_config(
     output_dir="./output"
 )
 print(f"✓ 配置已保存: {config_path}")
+```
+
+### 示例5: 标准化 Prompt 示例（Agent 输入模板）
+
+以下 Prompt 模板用于指导 Agent 在不同场景下正确调用 Skill，采用自然语言描述任务目标，同时嵌入必要的结构化信息。
+
+#### 场景1: 完整参数训练启动（推荐）
+
+用户明确指定所有关键路径，Agent 直接执行无需询问：
+
+```
+请将 Qwen3-VL-30B-A3B-Instruct 的 GPU 配置转换为 XPU 配置并启动训练。
+模型路径: /root/paddlejob/zhangxiao_dev/data/model_30B_A3B
+训练数据: /root/paddlejob/Gruge/data/coco_grounding/train.jsonl
+评估数据: /root/paddlejob/Gruge/data/coco_grounding/val2.jsonl
+Python 环境: /root/paddlejob/zhangxiao_dev/qwen_env
+输出路径: /root/paddlejob/Gruge/GitHub/Skills/paddleFormer-trainer/output
+```
+
+#### 场景2: 极简配置（自动检索）
+
+用户仅提供模型名称和 Python 环境，其他由 Agent 自动检索和推断：
+
+```
+我要在 XPU 上训练 DeepSeek-V2-Chat 模型，Python 环境在 /workspace/paddle_env，请帮我准备好所有配置并启动训练。
+```
+
+#### 场景3: 仅生成配置（不启动训练）
+
+用户只需要配置文件，后续手动检查或修改：
+
+```
+请为 Qwen3-VL-72B-A3B-Instruct 生成 XPU 训练配置和启动脚本，不要启动训练。
+模型路径: /data/models/qwen3vl-72b
+训练数据: /data/sft/train.jsonl
+Python 环境: /opt/paddle_env
+输出到: ./generated_configs
+```
+
+#### 场景4: 指定 API 追踪配置
+
+用户需要监控特定 API 的性能表现：
+
+```
+启动 Qwen3-VL-30B-A3B-Instruct 的 XPU 训练，并追踪以下 API: paddle.nn.functional.swiglu、paddle.nn.functional.flash_attention。
+模型路径: /data/models/qwen3vl-30b
+训练数据: /data/train.jsonl
+Python 环境: /root/paddle_env
+API 配置文件保存到: /data/configs/api_trace.yaml
+```
+
+#### 场景5: 自定义训练参数
+
+用户需要覆盖默认训练参数（如学习率、步数等）：
+
+```
+请转换 Qwen3-VL-30B-A3B-Instruct 的 XPU 配置并启动训练，使用以下自定义参数：
+- 学习率: 2.0e-5
+- 最大步数: 5000
+- 批次大小: 2
+- 梯度累积步数: 16
+模型路径: /data/models/qwen3vl-30b
+训练数据: /data/train.jsonl
+Python 环境: /root/paddle_env
+输出路径: /data/output
+```
+
+#### 场景6: 指定 GPU YAML 源配置
+
+用户已有确定的 GPU 配置模板，直接指定作为转换基础：
+
+```
+请基于 /path/to/PaddleFormers/configs/qwen3vl_sft.yaml 生成 XPU 配置并启动训练 Qwen3-VL-30B-A3B-Instruct。
+模型路径: /data/models/qwen3vl-30b
+训练数据: /data/train.jsonl
+Python 环境: /root/paddle_env
+输出路径: /data/output
+```
+
+#### 场景7: 启用自动错误修复
+
+用户允许 Agent 在遇到错误时自动尝试修复（最多指定次数）：
+
+```
+启动 DeepSeek-V2-Chat 的 XPU 训练，如果启动失败请自动尝试修复，最多尝试 3 次。
+模型路径: /data/models/deepseek-v2
+训练数据: /data/train.jsonl
+Python 环境: /root/paddle_env
+输出路径: /data/output
+```
+
+#### 场景8: 多机分布式训练
+
+明确指定分布式训练参数：
+
+```
+请为 Qwen3-VL-72B-A3B-Instruct 准备 XPU 分布式训练配置，使用 2 机 16 卡。
+模型路径: /shared/models/qwen3vl-72b
+训练数据: /shared/data/train.jsonl
+Python 环境: /shared/paddle_env
+主节点 IP: 192.168.1.100
+节点数量: 2
+每节点卡数: 8
+输出路径: /shared/output
 ```
 
 ---

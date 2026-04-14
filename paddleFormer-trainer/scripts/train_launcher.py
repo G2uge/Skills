@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-XPU 训练启动器
-整合配置生成、错误处理和训练启动的完整流程
+XPU 训练启动器 - Agent驱动版本
+整合配置生成、Agent监控和错误处理的完整流程
 """
 
 import os
@@ -16,11 +16,12 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(__file__))
 from gpu_yaml_finder import GPUYamlFinder
 from config_generator import XPUConfigGenerator
-from error_handler import ErrorHandler, ErrorType
+from error_handler import ErrorHandler, ErrorType, RepairStrategy
+from training_monitor_agent import TrainingMonitorAgent, TrainingStatus
 
 
 class TrainLauncher:
-    """训练启动器"""
+    """训练启动器 - Agent驱动架构"""
 
     def __init__(
         self,
@@ -123,7 +124,7 @@ class TrainLauncher:
             print(f"  ✓ 生成 XPU 配置: {xpu_yaml_path}")
             print(f"\n📋 配置生成方式:")
             print(f"   ⚠️ 基于参考配置生成（回退方案）")
-            print(f"   - 未找到模型 {model_name} 的GPU YAML配置")
+            print(f"   - 未找到模型 {model_name}的GPU YAML配置")
             print(f"   - 使用 reference_configs/xpu_reference.yaml 作为基础")
             print(f"   - ⚠️ 建议人工复核关键参数后再启动训练")
 
@@ -219,15 +220,15 @@ class TrainLauncher:
     def launch_training(
         self,
         script_path: str,
-        wait_for_start: bool = True,
+        use_agent_monitor: bool = True,
         timeout: int = 300
     ) -> Dict[str, Any]:
         """
-        启动训练任务
+        启动训练任务 - Agent驱动版本
 
         Args:
             script_path: 启动脚本路径
-            wait_for_start: 是否等待训练启动
+            use_agent_monitor: 是否使用Agent监控
             timeout: 超时时间
 
         Returns:
@@ -242,6 +243,7 @@ class TrainLauncher:
             "pid": None,
             "log_file": None,
             "error": None,
+            "agent_result": None,
         }
 
         # 执行启动脚本
@@ -274,21 +276,41 @@ class TrainLauncher:
                 time.sleep(1)
 
             if result["pid"]:
-                result["success"] = True
                 result["log_file"] = os.path.join(output_dir, 'train.log')
 
-                print(f"✓ 训练已启动")
+                print(f"✓ 训练进程已启动")
                 print(f"  PID: {result['pid']}")
                 print(f"  日志: {result['log_file']}")
 
-                # 等待训练启动验证
-                if wait_for_start:
-                    print(f"\n等待训练启动验证...")
-                    monitor_result = self._wait_for_training_start(
-                        output_dir,
-                        timeout
+                # Agent驱动的训练启动监控
+                if use_agent_monitor:
+                    print(f"\n🤖 启动Agent监控...")
+                    print(f"   模式: Agent驱动训练状态判定")
+                    print(f"   目标: 检测首个loss输出作为训练成功标志")
+                    
+                    # 创建Agent实例
+                    agent = TrainingMonitorAgent(timeout=timeout, poll_interval=5)
+                    
+                    # 执行Agent监控
+                    agent_result = agent.monitor_training_start(
+                        result["log_file"],
+                        callback=lambda msg: print(msg)
                     )
-                    result["start_status"] = monitor_result
+                    
+                    result["agent_result"] = agent_result
+                    
+                    # 根据Agent判定结果设置最终状态
+                    if agent_result["success"]:
+                        result["success"] = True
+                        result["status"] = "running"
+                    else:
+                        result["success"] = False
+                        result["status"] = agent_result.get("status", "failed")
+                        result["error"] = agent_result.get("reasoning", "Agent判定训练启动失败")
+                else:
+                    # 传统模式：仅检查进程是否存在
+                    print(f"\n⚠️  使用传统模式（无Agent监控）")
+                    result["success"] = True
 
             else:
                 result["error"] = "无法获取训练进程 PID"
@@ -300,56 +322,6 @@ class TrainLauncher:
 
         return result
 
-    def _wait_for_training_start(
-        self,
-        output_dir: str,
-        timeout: int
-    ) -> Dict[str, Any]:
-        """
-        等待训练启动并验证
-
-        Args:
-            output_dir: 输出目录
-            timeout: 超时时间
-
-        Returns:
-            启动状态字典
-        """
-        dist_log_dir = os.path.join(output_dir, 'paddleformers_dist_log')
-        worker_log_0 = os.path.join(dist_log_dir, 'workerlog.0')
-
-        start_time = time.time()
-
-        while time.time() - start_time < timeout:
-            # 检查 workerlog.0 是否存在
-            if os.path.exists(worker_log_0):
-                with open(worker_log_0, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
-
-                    # 检查错误
-                    error_info = self.error_handler.analyze_error(content)
-
-                    if error_info["error_type"] != ErrorType.UNKNOWN:
-                        return {
-                            "status": "error",
-                            "error_info": error_info,
-                            "log_content": content,
-                        }
-
-                    # 检查训练是否已开始
-                    if self.error_handler._is_training_started(content):
-                        return {
-                            "status": "success",
-                            "message": "训练已成功启动并开始输出 loss",
-                        }
-
-            time.sleep(5)
-
-        return {
-            "status": "timeout",
-            "message": f"等待超时（{timeout}秒），未检测到训练启动",
-        }
-
     def run_with_repair(
         self,
         model_name: str,
@@ -357,7 +329,7 @@ class TrainLauncher:
         custom_params: Dict[str, Any] = None
     ) -> Dict[str, Any]:
         """
-        运行训练并支持自动修复
+        运行训练并支持自动修复 - Agent驱动版本
 
         Args:
             model_name: 模型名称
@@ -382,90 +354,78 @@ class TrainLauncher:
                     custom_params=custom_params
                 )
 
-                # 2. 启动训练
-                launch_result = self.launch_training(script_path)
+                # 2. 启动训练（Agent驱动监控）
+                launch_result = self.launch_training(script_path, use_agent_monitor=True)
 
                 if not launch_result["success"]:
+                    # 启动失败，检查是否可以修复
                     print(f"\n✗ 启动失败: {launch_result['error']}")
+                    
+                    # 获取Agent监控结果
+                    agent_result = launch_result.get("agent_result", {})
+                    
+                    # 检查是否是Agent检测到的错误
+                    if agent_result and agent_result.get("status") == "error":
+                        final_analysis = agent_result.get("final_analysis", {})
+                        metrics = final_analysis.get("metrics", {})
+                        error_type = metrics.get("error_type", "unknown")
+                        
+                        print(f"\n⚠️  Agent检测到错误类型: {error_type}")
+                        
+                        # 尝试自动修复（仅针对特定错误类型）
+                        if error_type in ["out_of_memory", "communication_timeout", "config_error"]:
+                            print(f"   尝试自动修复...")
+                            
+                            # 构建修复策略
+                            repair_strategy = self._decide_repair_strategy(error_type, xpu_yaml_path)
+                            
+                            if repair_strategy:
+                                repair_success, repaired_path, repair_details = self.error_handler.execute_repair(
+                                    xpu_yaml_path,
+                                    repair_strategy["strategy"],
+                                    repair_strategy["changes"],
+                                    repair_strategy.get("comment_out", [])
+                                )
+                                
+                                if repair_success:
+                                    print(f"\n✓ 已自动修复配置")
+                                    print(f"   修改: {repair_details['changes']}")
+                                    continue  # 修复后重试
+                                else:
+                                    print(f"\n✗ 自动修复失败: {repair_details.get('error')}")
+                    
                     if attempt < max_attempts:
-                        print("准备重试...")
+                        print("\n准备重试...")
                         continue
                     else:
                         return {
                             "success": False,
                             "error": launch_result["error"],
                             "attempts": attempt,
+                            "agent_result": agent_result,
                         }
 
-                # 3. 检查启动状态
-                start_status = launch_result.get("start_status", {})
-
-                if start_status.get("status") == "success":
-                    print(f"\n✅ 训练已成功启动！")
-                    return {
-                        "success": True,
-                        "pid": launch_result["pid"],
-                        "config_path": xpu_yaml_path,
-                        "script_path": script_path,
-                        "output_dir": config_info["output_dir"],
-                        "attempts": attempt,
-                    }
-
-                elif start_status.get("status") == "error":
-                    error_info = start_status.get("error_info", {})
-
-                    if error_info.get("repairable"):
-                        print(f"\n⚠️ 检测到可修复错误: {error_info['error_type'].value}")
-                        print(f"   错误消息: {error_info['error_message']}")
-
-                        # 尝试修复
-                        success, repaired_path, repair_details = self.error_handler.repair_config(
-                            xpu_yaml_path,
-                            error_info
-                        )
-
-                        if success:
-                            print(f"\n✓ 已自动修复配置")
-                            print(f"   修改: {repair_details['changes']}")
-                            print(f"   备份: {repair_details.get('backup_path', 'N/A')}")
-
-                            # 重新生成启动脚本（因为配置路径可能变化）
-                            if repaired_path != xpu_yaml_path:
-                                print(f"   新配置: {repaired_path}")
-
-                            # 继续下一次尝试
-                            continue
-                        else:
-                            print(f"\n✗ 自动修复失败: {repair_details.get('error')}")
-
-                            if attempt < max_attempts:
-                                suggestions = self.error_handler.get_repair_suggestions(error_info)
-                                print("\n建议手动修复:")
-                                for suggestion in suggestions:
-                                    print(f"  - {suggestion}")
-
-                    else:
-                        print(f"\n✗ 检测到不可修复错误: {error_info['error_type'].value}")
-                        print(f"   错误消息: {error_info['error_message']}")
-
-                        suggestions = self.error_handler.get_repair_suggestions(error_info)
-                        print("\n建议:")
-                        for suggestion in suggestions:
-                            print(f"  - {suggestion}")
-
-                else:  # timeout
-                    print(f"\n⚠️ {start_status.get('message')}")
-                    print("请手动检查日志确认训练状态")
-
-                    return {
-                        "success": True,  # 可能是启动成功了只是检测超时
-                        "pid": launch_result["pid"],
-                        "config_path": xpu_yaml_path,
-                        "script_path": script_path,
-                        "output_dir": config_info["output_dir"],
-                        "warning": start_status.get("message"),
-                        "attempts": attempt,
-                    }
+                # 3. 启动成功（Agent已验证loss输出）
+                print(f"\n✅ 训练已成功启动并正常运行！")
+                print(f"   Agent判定: 训练状态正常")
+                
+                agent_result = launch_result.get("agent_result", {})
+                if agent_result:
+                    print(f"   启动耗时: {agent_result.get('elapsed_time', 0):.1f}秒")
+                    final_analysis = agent_result.get("final_analysis", {})
+                    metrics = final_analysis.get("metrics", {})
+                    if metrics.get("loss_values"):
+                        print(f"   检测到的Loss值: {metrics['loss_values'][:3]}")
+                
+                return {
+                    "success": True,
+                    "pid": launch_result["pid"],
+                    "config_path": xpu_yaml_path,
+                    "script_path": script_path,
+                    "output_dir": config_info["output_dir"],
+                    "attempts": attempt,
+                    "agent_result": agent_result,
+                }
 
             except Exception as e:
                 print(f"\n✗ 发生异常: {e}")
@@ -486,6 +446,55 @@ class TrainLauncher:
             "error": "达到最大尝试次数",
             "attempts": attempt,
         }
+    
+    def _decide_repair_strategy(self, error_type: str, config_path: str) -> Optional[Dict[str, Any]]:
+        """
+        Agent决策：根据错误类型决定修复策略
+        
+        Args:
+            error_type: 错误类型
+            config_path: 配置文件路径
+            
+        Returns:
+            修复策略字典
+        """
+        # 加载当前配置
+        config = self.error_handler._load_config(config_path)
+        
+        if error_type == "out_of_memory":
+            # OOM修复策略：减小batch size或增加accumulation
+            current_accum = config.get("gradient_accumulation_steps", 8)
+            new_accum = min(current_accum * 2, 64)
+            
+            return {
+                "strategy": RepairStrategy.REDUCE_BATCH_SIZE,
+                "changes": {"gradient_accumulation_steps": new_accum},
+                "comment_out": [],
+                "reasoning": f"OOM错误，增加gradient_accumulation_steps {current_accum} -> {new_accum}"
+            }
+        
+        elif error_type == "communication_timeout":
+            # 通信超时修复策略：增加timeout
+            current_timeout = config.get("bkcl_timeout", 1000)
+            new_timeout = min(current_timeout * 2, 5000)
+            
+            return {
+                "strategy": RepairStrategy.INCREASE_TIMEOUT,
+                "changes": {"bkcl_timeout": new_timeout},
+                "comment_out": [],
+                "reasoning": f"通信超时，增加bkcl_timeout {current_timeout} -> {new_timeout}"
+            }
+        
+        elif error_type == "config_error":
+            # 配置错误：尝试从参考配置补全
+            return {
+                "strategy": RepairStrategy.FROM_REFERENCE,
+                "changes": {"device": "xpu"},  # 至少确保device字段
+                "comment_out": [],
+                "reasoning": "配置错误，尝试补全关键字段"
+            }
+        
+        return None
 
     def print_summary(self, config_info: Dict[str, Any]):
         """打印配置摘要"""
@@ -525,7 +534,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description='Launch XPU training with auto-repair'
+        description='Launch XPU training with Agent-driven monitoring'
     )
     parser.add_argument('model_name', help='Model name')
     parser.add_argument(
@@ -548,6 +557,11 @@ def main():
         action='store_true',
         help='Only prepare configs without launching'
     )
+    parser.add_argument(
+        '--no-agent',
+        action='store_true',
+        help='Disable Agent monitoring (use legacy mode)'
+    )
 
     args = parser.parse_args()
 
@@ -564,20 +578,40 @@ def main():
         print(f"  手动启动命令: bash {script_path}")
     else:
         # 启动训练（支持自动修复）
-        result = launcher.run_with_repair(
-            args.model_name,
-            max_attempts=args.max_attempts
-        )
+        if args.no_agent:
+            print("⚠️  使用传统模式（无Agent监控）")
+            xpu_yaml, script_path, config_info, _ = launcher.prepare_training(args.model_name)
+            result = launcher.launch_training(script_path, use_agent_monitor=False)
+        else:
+            print("🤖 使用Agent驱动模式")
+            result = launcher.run_with_repair(
+                args.model_name,
+                max_attempts=args.max_attempts
+            )
 
         if result["success"]:
             print(f"\n✅ 训练启动成功！")
             print(f"  PID: {result['pid']}")
             print(f"  输出目录: {result['output_dir']}")
             print(f"  监控命令: tail -f {result['output_dir']}/paddleformers_dist_log/workerlog.0")
+            
+            # 显示Agent监控摘要
+            agent_result = result.get("agent_result")
+            if agent_result:
+                print(f"\n📊 Agent监控摘要:")
+                print(f"   启动耗时: {agent_result.get('elapsed_time', 0):.1f}秒")
+                print(f"   最终状态: {agent_result.get('status', 'unknown')}")
         else:
             print(f"\n✗ 训练启动失败")
             print(f"  错误: {result['error']}")
             print(f"  尝试次数: {result['attempts']}")
+            
+            # 显示Agent详细分析
+            agent_result = result.get("agent_result")
+            if agent_result and agent_result.get("recommendations"):
+                print(f"\n💡 Agent建议:")
+                for rec in agent_result["recommendations"]:
+                    print(f"   - {rec}")
             return 1
 
     return 0

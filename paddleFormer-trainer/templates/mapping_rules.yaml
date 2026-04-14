@@ -8,6 +8,21 @@
 # 1. 字段映射规则 - 字段名称或值的直接替换
 # =============================================================================
 field_mappings:
+  # 1.0 数据类型字段（必须原样保留，禁止覆盖）
+  dataset_type:
+    source_key: "train_dataset_type"
+    target_key: "train_dataset_type"
+    rule_type: "preserve"
+    priority: 0
+    description: "从GPU配置原样保留，不使用参考配置覆盖"
+    
+  eval_dataset_type:
+    source_key: "eval_dataset_type"
+    target_key: "eval_dataset_type"
+    rule_type: "preserve"
+    priority: 0
+    description: "从GPU配置原样保留，不使用参考配置覆盖"
+
   # 1.1 设备类型字段（核心）
   device:
     source_key: null  # 可能不存在于GPU配置中
@@ -38,6 +53,18 @@ field_mappings:
 # 2. 参数变换规则 - 参数值的调整逻辑
 # =============================================================================
 parameter_transformations:
+  # 2.0 数据配置字段（必须原样保留）
+  dataset_configuration:
+    description: "数据类型相关配置必须从GPU配置原样保留"
+    preserve_fields:
+      - key: "train_dataset_type"
+        rule: "preserve_from_gpu"
+        description: "训练数据集类型，与GPU配置保持一致"
+      - key: "eval_dataset_type"
+        rule: "preserve_from_gpu"
+        description: "评估数据集类型，与GPU配置保持一致"
+    note: "这些字段定义了数据格式，与硬件无关，必须严格对齐GPU配置"
+
   # 2.1 训练步数相关参数（根据任务和硬件调整）
   training_steps:
     parameters:
@@ -356,6 +383,7 @@ conversion_workflow:
   step3_parameter_transformation:
     description: "应用参数变换"
     actions:
+      - "保留train_dataset_type和eval_dataset_type（与GPU配置一致）"
       - "调整gradient_accumulation_steps"
       - "设置packing和benchmark为false"
       - "根据任务类型调整max_steps"

@@ -20,8 +20,9 @@ description: |
 1. **智能YAML检索** - 基于语义相似性自动检索最匹配的GPU训练配置
 2. **智能配置转换** - 基于实际配置对比总结的映射规则，将 GPU YAML 转换为 XPU YAML
 3. **启动脚本生成** - 基于模板自动构建 XPU 训练启动脚本
-4. **错误自修复** - 训练失败时自动检测、分类并修复错误
-5. **参考配置支撑** - 使用预置的可运行 XPU 配置作为修复基准
+4. **Agent驱动的训练监控** - 由Agent主动监控训练日志，以首个loss输出作为训练成功标志，与错误修复联动
+5. **错误自修复** - 训练失败时自动检测、分类并修复错误
+6. **参考配置支撑** - 使用预置的可运行 XPU 配置作为修复基准
 
 ## 工作流程
 
@@ -834,8 +835,12 @@ AI 执行配置转换的完整流程：
 | `{{NUM_XPUS}}` | XPU 设备数量 | 自动检测或用户指定 |
 | `{{XPU_DEVICES}}` | XPU 设备列表 | 自动检测或用户指定 |
 | `{{PYTHON_ENV_PATH}}` | **Python 虚拟环境路径** | **必需：用户必须指定** |
+| `{{API_YAML_PATH}}` | API 追踪配置文件路径 | 用户提供或自动生成 |
+| `{{API_CONFIG_PATH}}` | API 配置文件路径 | 固定为 `${OUTPUT_DIR}/api_config.txt` |
+| `{{FLAGS_TRACE_API}}` | API 追踪组合路径 | 自动拼接: `${API_YAML_PATH},${API_CONFIG_PATH}` |
+| `{{LD_LIBRARY_PATH}}` | 动态库搜索路径 | 基于 `PYTHON_ENV_PATH` 动态生成 |
 
-**关于 PYTHON_ENV_PATH**：
+**关于 PYTHON_ENV_PATH**:
 
 这是启动脚本中**唯一需要用户手动指定**的路径参数，用于激活 Paddle/PaddleFormers 运行环境。
 
@@ -858,6 +863,104 @@ export PYTHON_ENV_PATH="/root/paddlejob/zhangxiao_dev/qwen_env"
 /workspace/paddle_env
 /home/user/paddle_xpu_env
 ```
+
+#### 动态参数处理规则
+
+**1. FLAGS_trace_api 参数**
+
+`FLAGS_trace_api` 用于指定 API 追踪相关文件的路径，包含 `api.yaml` 和 `api_config.txt` 两个文件。
+
+**路径处理逻辑**：
+```
+场景1: 用户显式提供 api.yaml 路径
+  → 使用用户提供的 api.yaml 路径
+  → api_config.txt 统一放置在输出目录: ${OUTPUT_DIR}/api_config.txt
+
+场景2: 用户未提供 api.yaml
+  → 在输出目录自动生成: ${OUTPUT_DIR}/api.yaml
+  → 初始化为标准 YAML 格式: apis: []
+  → api_config.txt 统一放置在输出目录: ${OUTPUT_DIR}/api_config.txt
+```
+
+**api.yaml 标准格式**：
+```yaml
+apis:
+  - paddle.nn.functional.swiglu
+  - paddle.nn.functional.flash_attention
+```
+
+**动态填充能力**：
+- 系统可根据模型类型自动推荐需要追踪的 API 列表
+- 用户可在生成后手动编辑补充具体 API
+- 路径拼接规则: `${FLAGS_trace_api}="${API_YAML_PATH},${OUTPUT_DIR}/api_config.txt"`
+
+**2. LD_LIBRARY_PATH 动态拼接**
+
+`LD_LIBRARY_PATH` 必须基于 `PYTHON_ENV_PATH` 动态生成，**禁止写死固定路径**。
+
+**拼接规则**：
+```bash
+# 正确做法: 基于 PYTHON_ENV_PATH 动态拼接
+export LD_LIBRARY_PATH=${PYTHON_ENV_PATH}/lib/python3.10/site-packages/paddle/libs/:${LD_LIBRARY_PATH}
+
+# 错误做法: 禁止写死路径
+# export LD_LIBRARY_PATH=/root/paddlejob/zhangxiao_dev/qwen_env/lib/python3.10/site-packages/paddle/libs/:${LD_LIBRARY_PATH}
+```
+
+**处理逻辑**：
+1. 获取用户指定的 `PYTHON_ENV_PATH`
+2. 提取 Python 版本号（如 3.10）
+3. 动态拼接 Paddle 库路径: `${PYTHON_ENV_PATH}/lib/python${PYTHON_VERSION}/site-packages/paddle/libs/`
+4. 追加到现有 `LD_LIBRARY_PATH`
+
+**验证机制**：
+脚本生成时会检查 `LD_LIBRARY_PATH` 是否包含动态拼接的 `${PYTHON_ENV_PATH}` 变量，如果检测到写死路径则报错提示修改。
+
+**模板变量映射**：
+
+| 模板变量 | 来源 | 处理逻辑 |
+|---------|------|---------|
+| `{{PYTHON_ENV_PATH}}` | 用户提供 | 必须指定的环境路径 |
+| `{{API_YAML_PATH}}` | 动态生成 | 用户提供路径或 `${OUTPUT_DIR}/api.yaml` |
+| `{{LD_LIBRARY_PATH}}` | 动态拼接 | 基于 `{{PYTHON_ENV_PATH}}` 生成 |
+| `{{FLAGS_TRACE_API}}` | 组合生成 | `${API_YAML_PATH},${OUTPUT_DIR}/api_config.txt` |
+
+#### 启动脚本生成逻辑
+
+**生成流程**：
+1. **API 配置文件处理**：
+   - 检查用户是否提供了 `api.yaml` 路径
+   - 如未提供，在 `${OUTPUT_DIR}` 下创建默认 `api.yaml`（格式：`apis:` 或包含具体 API 列表）
+   - `api_config.txt` 统一生成在 `${OUTPUT_DIR}/api_config.txt`
+
+2. **环境变量动态替换**：
+   ```bash
+   # 模板中使用变量占位符
+   export FLAGS_trace_api="{{FLAGS_TRACE_API}}"
+   export LD_LIBRARY_PATH={{LD_LIBRARY_PATH}}:${LD_LIBRARY_PATH}
+   ```
+
+3. **模板变量替换**：
+   - `{{FLAGS_TRACE_API}}` → `${API_YAML_PATH},${OUTPUT_DIR}/api_config.txt`
+   - `{{LD_LIBRARY_PATH}}` → `${PYTHON_ENV_PATH}/lib/python${VERSION}/site-packages/paddle/libs/`
+   - `{{PYTHON_ENV_PATH}}` → 用户提供的路径
+
+**模板示例**：
+```bash
+# =============================================================================
+# 动态生成参数（根据环境自动配置）
+# =============================================================================
+# API trace 配置路径（动态生成）
+export FLAGS_trace_api="{{FLAGS_TRACE_API}}"
+
+# 动态库路径（基于 PYTHON_ENV_PATH 动态拼接）
+export LD_LIBRARY_PATH={{LD_LIBRARY_PATH}}:${LD_LIBRARY_PATH}
+```
+
+**禁止行为**：
+- 禁止在生成后的脚本中写死绝对路径
+- 禁止将动态参数标记为"不可修改"
+- 禁止省略 `api.yaml` 的自动生成逻辑
 
 ### 阶段4：训练任务启动
 
@@ -908,6 +1011,267 @@ export PYTHON_ENV_PATH="/root/paddlejob/zhangxiao_dev/qwen_env"
    - 如果用户仅要求生成配置或意图不明确，明确询问用户是否立即启动训练
    - 根据用户确认或指令意图执行训练启动
 
+### 阶段4.5：Agent驱动的训练启动监控
+
+**架构定位**：从"代码驱动"升级为"Agent驱动"的训练状态判定，与阶段5的"Agent驱动的错误检测与修复"形成联动闭环。
+
+> **设计原则**：
+> - **Agent推理**：由Agent主动分析日志，推理判断训练状态，而非简单的正则匹配
+> - **动态决策**：基于观察到的日志内容动态决策是否继续监控或终止
+> - **准确判定**：以首个loss输出作为训练真正开始的标志，而非仅判断进程是否存在
+> - **错误联动**：与错误检测修复模块共享错误类型定义，实现无缝联动
+
+#### 4.5.1 Agent监控的执行流程
+
+```
+启动训练脚本并获取PID
+    ↓
+创建TrainingMonitorAgent实例
+    ↓
+循环监控日志文件
+    ├── Agent读取新增日志内容
+    ├── Agent分析日志并推理状态
+    ├── Agent决策：继续监控/判定成功/判定失败
+    └── 直到超时或获得明确结论
+    ↓
+返回监控结果
+    ├── 成功：检测到loss输出
+    ├── 失败：检测到错误信号 → 触发阶段5错误修复
+    └── 超时：未检测到训练开始信号
+```
+
+#### 4.5.2 Agent核心能力
+
+**TrainingMonitorAgent** 具备以下核心能力：
+
+| 能力 | 说明 | 实现方式 |
+|------|------|----------|
+| 日志增量分析 | 只读取新增日志内容，避免重复处理 | 文件指针跟踪 |
+| 状态推理 | 基于多维度信号推理训练状态 | 状态机 + 置信度评估 |
+| Loss检测 | 识别训练已开始的关键证据 | 多模式正则匹配 |
+| 错误检测 | 识别训练启动过程中的各类错误 | 与ErrorHandler共享错误模式 |
+| 动态决策 | 基于时间和状态综合决策 | 可配置的决策策略 |
+
+#### 4.5.3 训练状态判定逻辑
+
+Agent分析日志时，按以下优先级判定状态：
+
+**状态优先级（从高到低）**：
+
+1. **RUNNING（运行中）** - 置信度：95%
+   - 判定条件：检测到loss输出
+   - 检测模式：`loss:\s*\d+\.?\d*`、`train_loss:\s*\d+\.?\d*`、`step:\s*\d+.*loss`
+   - 结论：训练已成功启动并正常运行
+
+2. **ERROR（错误）** - 置信度：90%
+   - 判定条件：检测到错误信号
+   - 错误类型：
+     - `out_of_memory`: OOM相关错误
+     - `communication_error`: BKCL/NCCL通信错误
+     - `config_error`: 配置缺失或无效
+     - `runtime_error`: 运行时错误
+     - `operator_error`: 算子不支持
+   - 结论：训练启动失败，触发错误修复流程
+
+3. **INITIALIZING（初始化中）** - 置信度：70%
+   - 判定条件：检测到初始化活动但无loss输出
+   - 检测模式：`Loading checkpoint`、`Initializing model`、`Preparing data`
+   - 结论：训练正在启动，继续监控
+
+4. **UNKNOWN（未知）** - 置信度：50%
+   - 判定条件：未检测到任何已知模式
+   - 结论：无法确定状态，继续监控直到超时
+
+#### 4.5.4 与错误检测修复的联动机制
+
+**联动架构**：
+
+```
+┌─────────────────────┐
+│ TrainingMonitorAgent│
+│   (训练监控Agent)    │
+└──────────┬──────────┘
+           │ 检测到error状态
+           │ 提取error_type
+           ▼
+┌─────────────────────┐     获取错误上下文      ┌─────────────────┐
+│  run_with_repair    │ ─────────────────────→ │  ErrorHandler   │
+│   (错误修复决策)     │                        │  (错误处理Skill) │
+└──────────┬──────────┘                        └─────────────────┘
+           │
+           │ 判断可修复性
+           ▼
+    ┌──────────────┐
+    │  可修复错误   │ ──→ 执行自动修复 ──→ 重新启动训练
+    │ (OOM/超时等)  │
+    └──────────────┘
+           │
+           │ 不可修复错误
+           ▼
+    ┌──────────────┐
+    │ 不可修复错误  │ ──→ 显式返回错误信息 ──→ 建议人工处理
+    │(RuntimeError等)│
+    └──────────────┘
+```
+
+**联动的错误类型映射**：
+
+| Agent检测到的错误类型 | 对应ErrorHandler策略 | 自动修复 | 联动处理 |
+|---------------------|---------------------|---------|---------|
+| `out_of_memory` | `REDUCE_BATCH_SIZE` | ✅ | Agent监控发现 → 触发修复 → 重试 |
+| `communication_error` | `INCREASE_TIMEOUT` | ✅ | Agent监控发现 → 触发修复 → 重试 |
+| `config_error` | `FROM_REFERENCE` | ✅ | Agent监控发现 → 触发修复 → 重试 |
+| `runtime_error` | `CANNOT_FIX` | ❌ | Agent监控发现 → 显式返回错误 |
+| `operator_error` | `COMMENT_OUT_OPERATOR` | ⚠️ | Agent监控发现 → 尝试修复/人工介入 |
+
+#### 4.5.5 Agent决策流程
+
+Agent基于当前分析结果和已用时间做决策：
+
+```python
+def make_decision(analysis_result, elapsed_time, timeout):
+    # 情况1: 检测到Loss，训练成功
+    if analysis_result.status == RUNNING:
+        return {
+            "should_continue": False,
+            "is_training_started": True,
+            "reasoning": "检测到loss输出，训练已正常运行"
+        }
+    
+    # 情况2: 检测到错误，训练失败
+    if analysis_result.status == ERROR:
+        return {
+            "should_continue": False,
+            "is_training_started": False,
+            "error_type": analysis_result.error_type,
+            "reasoning": f"检测到{analysis_result.error_type}错误"
+        }
+    
+    # 情况3: 超时
+    if elapsed_time >= timeout:
+        return {
+            "should_continue": False,
+            "is_training_started": False,
+            "status": TIMEOUT,
+            "reasoning": "监控超时，未检测到训练开始信号"
+        }
+    
+    # 情况4: 继续监控
+    return {
+        "should_continue": True,
+        "is_training_started": False,
+        "reasoning": f"等待训练启动信号（{elapsed_time}/{timeout}秒）"
+    }
+```
+
+#### 4.5.6 监控执行示例
+
+**场景1: 训练成功启动**
+
+```
+🤖 Agent开始监控训练启动...
+   日志文件: ./checkpoints/train_xxx/paddleformers_dist_log/workerlog.0
+   超时设置: 300秒
+
+📊 Agent分析 [15.2s]
+   状态: INITIALIZING (置信度: 70%)
+   推理: 训练正在初始化（5%），继续监控...
+   证据: 检测到初始化: Loading model weights...
+
+📊 Agent分析 [32.8s]
+   状态: INITIALIZING (置信度: 75%)
+   推理: 训练正在初始化（11%），继续监控...
+   证据: 检测到初始化: Preparing training data...
+
+📊 Agent分析 [58.5s]
+   状态: RUNNING (置信度: 95%)
+   推理: 检测到3个loss值，训练已正常运行
+   证据: 检测到Loss模式: loss:\s*(\d+\.?\d*)
+   检测到的Loss: [2.456, 2.234, 2.012]
+
+✅ Agent判定: 训练已成功启动！
+   启动耗时: 58.5秒
+   训练状态: 正常运行
+```
+
+**场景2: 检测到错误并触发修复**
+
+```
+🤖 Agent开始监控训练启动...
+   日志文件: ./checkpoints/train_xxx/paddleformers_dist_log/workerlog.0
+   超时设置: 300秒
+
+📊 Agent分析 [12.5s]
+   状态: INITIALIZING (置信度: 70%)
+   推理: 训练正在初始化（4%），继续监控...
+
+📊 Agent分析 [28.3s]
+   状态: ERROR (置信度: 90%)
+   推理: 检测到out_of_memory错误，训练启动失败
+   证据: 检测到错误: out_of_memory - XPU OOM
+   错误详情: allocate memory failed
+
+❌ Agent判定: 训练启动失败
+   原因: 检测到out_of_memory错误
+
+⚠️  Agent检测到可修复错误: out_of_memory
+   尝试自动修复...
+
+✓ 已自动修复配置
+   修改: {'gradient_accumulation_steps': 16}
+   备份: train_xpu.yaml.backup.20250115_143022
+
+准备重试...
+```
+
+**场景3: 超时未检测到训练启动**
+
+```
+🤖 Agent开始监控训练启动...
+   日志文件: ./checkpoints/train_xxx/paddleformers_dist_log/workerlog.0
+   超时设置: 60秒
+
+📊 Agent分析 [20.1s]
+   状态: UNKNOWN (置信度: 50%)
+   推理: 未检测到已知模式，继续监控...
+
+📊 Agent分析 [45.7s]
+   状态: UNKNOWN (置信度: 50%)
+   推理: 未检测到已知模式，继续监控...
+
+📊 Agent分析 [60.0s]
+   状态: TIMEOUT
+   推理: 监控超时（60秒），未检测到训练开始信号
+
+❌ Agent判定: 训练启动失败
+   原因: 监控超时，未检测到训练开始信号
+
+💡 Agent建议:
+   - 检查配置是否正确
+   - 确认模型和数据集可访问
+   - 考虑增加超时时间
+```
+
+#### 4.5.7 与传统模式兼容
+
+保留传统模式以支持特殊场景：
+
+```python
+# Agent驱动模式（默认）- 推荐
+launcher.launch_training(script_path, use_agent_monitor=True)
+
+# 传统模式（向后兼容）- 仅检查进程是否存在
+launcher.launch_training(script_path, use_agent_monitor=False)
+```
+
+| 特性 | 传统模式 | Agent驱动模式 |
+|------|---------|--------------|
+| 判定逻辑 | 进程存在即成功 | Agent推理决策 |
+| 成功标志 | PID获取 | 检测到loss输出 |
+| 错误感知 | 无 | 实时检测并联动修复 |
+| 可解释性 | 弱 | 强，输出完整推理过程 |
+| 灵活性 | 低 | 高，Agent自主决策 |
+
 ### 阶段5：错误检测与自修复机制
 
 **错误分类与处理策略**：
@@ -930,7 +1294,7 @@ export PYTHON_ENV_PATH="/root/paddlejob/zhangxiao_dev/qwen_env"
 ## 配置文件结构
 
 ```
-paddle-trainer2/
+paddleFormer-trainer/
 ├── SKILL.md                          # 本文件
 ├── templates/
 │   ├── xpu_train.sh.template         # XPU 启动脚本模板
@@ -939,7 +1303,8 @@ paddle-trainer2/
 │   ├── config_generator.py           # 配置生成器核心
 │   ├── gpu_yaml_finder.py            # GPU YAML 检索器
 │   ├── error_handler.py              # 错误检测与修复
-│   └── train_launcher.py             # 训练启动器
+│   ├── train_launcher.py             # 训练启动器
+│   └── training_monitor_agent.py     # Agent驱动的训练监控
 └── reference_configs/
     └── xpu_reference.yaml            # XPU 参考配置
 ```
