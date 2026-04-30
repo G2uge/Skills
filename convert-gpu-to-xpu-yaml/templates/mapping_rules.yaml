@@ -1,0 +1,226 @@
+# GPU to XPU YAML Conversion Rules Definition
+# GPU 到 XPU YAML 转换规则定义
+
+version: "1.0.0"
+description: "PaddleFormer GPU to XPU YAML conversion rules / PaddleFormer GPU 到 XPU YAML 转换规则"
+
+# 1. Field Mapping Rules / 字段映射规则
+field_mappings:
+  # Device declaration / 设备声明
+  device:
+    action: "add"
+    value: "xpu"
+    position: "end"
+    required: true
+    description: "XPU execution required field / XPU 运行必需字段"
+  
+  # Attention implementation / Attention 实现
+  _attn_implementation:
+    action: "rename_and_comment"
+    new_name: "attn_impl"
+    reason: "XPU flashmask support may need special version / XPU flashmask 支持可能需要特殊版本"
+  
+  # Communication backend replacement / 通信后端替换
+  backend_replacement:
+    pattern: "nccl"
+    replacement: "bkcl"
+    fields:
+      - "backend"
+      - "distributed_backend"
+    description: "Replace NCCL with BKCL for XPU / XPU 使用 BKCL 替换 NCCL"
+
+# 2. Parameter Transformation Rules / 参数变换规则
+parameter_transformations:
+  gradient_accumulation_steps:
+    action: "halve"
+    description: "Typically half of GPU value / 通常为 GPU 值的一半"
+    min_value: 1
+    description_cn: "根据 XPU 显存调整，通常为 GPU 值的一半"
+    description_en: "Adjust based on XPU memory, typically half of GPU value"
+  
+  packing:
+    action: "set"
+    value: false
+    reason: "XPU memory management strategy differs / XPU 内存管理策略不同"
+  
+  benchmark:
+    action: "set"
+    value: false
+    reason: "Ensure XPU runtime stability / 确保 XPU 运行稳定性"
+
+# 3. Structural Adjustment Rules / 结构调整规则
+structural_adjustments:
+  comment_out_fields:
+    - field: "_attn_implementation"
+      reason: "Rename to attn_impl and comment / 重命名为 attn_impl 并注释"
+    - field: "moe_deep_gemm"
+      reason: "Deep GEMM may be GPU-specific / Deep GEMM 可能是 GPU 特有"
+    - field: "fuse_attention_qkv"
+      reason: "Fusion operator needs verification / 融合算子需验证"
+    - field: "fuse_attention_ffn"
+      reason: "Fusion operator needs verification / 融合算子需验证"
+    - field: "fuse_rms_norm"
+      reason: "Fusion operator needs verification / 融合算子需验证"
+    - field: "tp_delay_scale_loss"
+      reason: "May not be supported on XPU / XPU 可能不支持"
+    - field: "fuse_*"
+      pattern: true
+      reason: "Fusion operators need XPU-specific implementation / 融合算子需要 XPU 特定实现"
+  
+  add_fields:
+    - name: "device"
+      value: "xpu"
+      position: "end"
+      required: true
+      description: "XPU required field / XPU 必需字段"
+    - name: "pp_delay_scale_loss"
+      value: true
+      position: "pipeline_parallel_section"
+      required: false
+      description: "XPU optimization for PP / XPU PP 优化"
+
+# 4. Default Values for Filling / 默认值补全
+default_values:
+  xpu_required:
+    device: "xpu"
+    bf16: true
+    amp_master_grad: true
+    description: "Core XPU required fields / XPU 核心必需字段"
+  
+  communication:
+    bkcl_timeout: 1000
+    bkcl_socket_ifname: "eth0"
+    bkcl_enable_xdr: 1
+    description: "XPU communication configuration / XPU 通信配置"
+  
+  parallel_strategy:
+    tensor_model_parallel_size: 1
+    expert_model_parallel_size: 8
+    use_expert_parallel: true
+    description: "Parallel strategy defaults / 并行策略默认值"
+
+# 5. Pattern Rules / 模式规则
+pattern_rules:
+  backend_unified_replacement:
+    description: "Unified communication backend replacement / 统一通信后端替换"
+    description_cn: "统一替换通信后端"
+    from: "nccl"
+    to: "bkcl"
+    scope:
+      - "backend"
+      - "distributed_backend"
+      - "device"
+  
+  fusion_operator_handling:
+    description: "GPU fusion operator handling on XPU / GPU 融合算子在 XPU 上的处理"
+    description_cn: "GPU 融合算子在 XPU 上的处理策略"
+    patterns:
+      - "fuse_*"
+      - "*_fusion"
+    action: "comment_out"
+    reason: "Fusion operators need XPU-specific implementation support / 融合算子需要 XPU 特定实现支持"
+  
+  memory_optimization:
+    description: "Automatic adjustment based on hardware memory / 根据硬件内存自动调整"
+    description_cn: "内存优化模式"
+    rules:
+      - parameter: "gradient_accumulation_steps"
+        rule: "halve"
+        note: "Typically half of GPU value / 通常为 GPU 值的一半"
+      - parameter: "packing"
+        value: false
+        note: "Recommended to disable / 建议关闭"
+      - parameter: "benchmark"
+        value: false
+        note: "Recommended to disable for stability / 建议关闭以确保稳定性"
+  
+  precision_mode:
+    description: "XPU default uses bf16, consistent with GPU / XPU 默认使用 bf16，与 GPU 保持一致"
+    description_cn: "精度模式"
+    rules:
+      - if_gpu_bf16: "keep"
+      - if_gpu_fp16: "convert_to_bf16"
+      - fp16_opt_level: "may not take effect / 可能不生效"
+
+# 6. Path Override Rules / 路径覆盖规则
+path_overrides:
+  model_path:
+    target_field: "model_name_or_path"
+    description: "Override model path / 覆盖模型路径"
+    description_cn: "使用用户提供的 model_path 覆盖 model_name_or_path"
+    description_en: "Override model_name_or_path with user-provided model_path"
+
+  train_dataset_path:
+    target_fields:
+      - "train_dataset_path"
+      - "train_data_path"
+      - "train_data"
+    description: "Override training dataset path / 覆盖训练数据集路径"
+    description_cn: "按优先级顺序查找并替换训练数据路径"
+    description_en: "Find and replace training dataset path in priority order"
+
+  eval_dataset_path:
+    target_fields:
+      - "eval_dataset_path"
+      - "eval_data_path"
+      - "validation_dataset_path"
+      - "val_dataset_path"
+    description: "Override evaluation dataset path / 覆盖评估数据集路径"
+    description_cn: "按优先级顺序查找并替换评估数据路径"
+    description_en: "Find and replace evaluation dataset path in priority order"
+
+  dataset_dir:
+    type: "directory_with_extraction"
+    description: "Dataset directory with auto filename extraction / 数据集目录，自动提取文件名拼接"
+    description_cn: "提供数据集目录，Skill 自动从 GPU YAML 提取文件名并拼接完整路径"
+    description_en: "Provide dataset directory, Skill auto-extracts filenames from GPU YAML and constructs full paths"
+    extraction_fields:
+      train:
+        source_fields:
+          - "train_dataset_path"
+          - "train_data_path"
+        default_filename: "train.jsonl"
+      eval:
+        source_fields:
+          - "eval_dataset_path"
+          - "eval_data_path"
+          - "validation_dataset_path"
+          - "val_dataset_path"
+        default_filename: "val.jsonl"
+    priority: "medium"  # 低于 train_dataset_path/eval_dataset_path，高于 dataset_path
+    apply_when:
+      - "train_dataset_path not provided"
+      - "eval_dataset_path not provided"
+
+  dataset_path:
+    type: "batch_prefix"
+    description: "Batch override dataset path prefix / 批量覆盖数据集路径前缀"
+    description_cn: "当未提供具体路径时，批量替换所有数据集路径前缀"
+    description_en: "Batch replace all dataset path prefixes when specific paths not provided"
+    priority: "low"  # 低于具体路径参数 / lower than specific path parameters
+    apply_when:
+      - "train_dataset_path not provided"
+      - "eval_dataset_path not provided"
+      - "dataset_dir not provided"
+
+# 8. Validation Rules / 验证规则
+validation:
+  required_fields:
+    - "model_name_or_path"
+    - "stage"
+    - "per_device_train_batch_size"
+    - "device"
+  
+  post_conversion_checks:
+    - check: "yaml_syntax"
+      description: "Verify YAML syntax is valid / 验证 YAML 语法正确"
+    - check: "required_fields_present"
+      description: "All required fields are present / 所有必需字段存在"
+    - check: "device_is_xpu"
+      description: "device field is set to xpu / device 字段设置为 xpu"
+
+# 9. Output Configuration / 输出配置
+output:
+  default_suffix: "_xpu"
+  default_pattern: "{original_filename}_xpu.yaml"
+  description: "Default output filename pattern / 默认输出文件名模式"
