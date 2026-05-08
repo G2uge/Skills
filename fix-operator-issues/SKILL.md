@@ -5,7 +5,11 @@ description: Fix CUDA-only fused operator compatibility issues on XPU backends b
 
 > **适用范围**：训练过程中因 CUDA-only 算子（custom op / fused kernel）在 XPU 后端不可用而失败的场景。
 > **典型错误**：`NotImplementedError: .* is not implemented for non-CUDA backends`
-> **修复策略**：分析 CUDA kernel 数学逻辑 → 用原生 Paddle API 实现等价回退 → 修改路由使非 CUDA 后端走回退路径 → 生成测试验证等价性。
+> **修复策略**：
+> 1. 向上追溯调用链，检查上游是否存在非融合的退化逻辑（如 else 分支使用原生 Paddle API 的实现）。
+>    - 若存在：修改上游判断条件，增加 `paddle.is_compiled_with_cuda()` 判断，使非 CUDA 后端自动走退化路径。
+>    - 若不存在：进入步骤 2。
+> 2. 分析 CUDA kernel 数学逻辑 → 用原生 Paddle API 实现等价回退 → 修改底层路由使非 CUDA 后端走回退路径 → 生成测试验证等价性。
 
 ---
 
@@ -72,6 +76,37 @@ execution_flow:
     expected_files:
       - "<cuda_kernel>.cu"        # CUDA kernel 实现
       - "<python_wrapper>.py"     # Python 封装和 backward 逻辑
+
+  step_2b_trace_call_chain:
+    description: "向上追溯调用链，检查是否存在上游退化路径"
+    actions:
+      - "从报错算子出发，通过 grep/ast 分析向上追溯 2-3 层调用者"
+      - "重点关注：条件分支（if/elif/else）中是否存在非融合退化逻辑"
+      - "典型模式：融合路径调用 fused_xxx_impl / xxxFunction.apply，退化路径使用 paddle.chunk + F.xxx + paddle.multiply 等标准 API"
+    search_patterns:
+      - "调用当前算子/函数的上一层函数（如 bias_swiglu_impl 调用 swiglu_back）"
+      - "再上一层调用者（如 mlp.py 中的 bias_activation_fusion 分支）"
+      - "else 分支中是否存在非融合的等价实现"
+    decision_criteria:
+      - "若上游存在 else 分支的非融合退化逻辑 → 进入 step_2c_patch_upstream"
+      - "若上游无退化逻辑，或退化逻辑数学不等价 → 跳过到 step_3_analyze_kernel"
+
+  step_2c_patch_upstream:
+    description: "修改上游判断条件，使非 CUDA 后端走退化路径"
+    principles:
+      - "最小侵入：只修改条件判断，不动退化逻辑本身"
+      - "保持现有 CUDA 路径不变"
+    modification_pattern:
+      - "将 `elif self.config.bias_activation_fusion:` 改为 `elif self.config.bias_activation_fusion and paddle.is_compiled_with_cuda():`"
+      - "或类似地，在融合路径入口处增加 `and paddle.is_compiled_with_cuda()` 判断"
+    validation:
+      - "确认非 CUDA 后端会进入 else 分支"
+      - "确认 CUDA 后端行为不变"
+    on_success:
+      - "跳过底层算子 fallback 实现，直接进入 step_5_generate_tests（验证训练能否跑通）"
+      - "或直接进入 step_7_return（标记修复完成）"
+    on_failure:
+      - "若上游修改后仍有其他错误 → 回退到 step_3_analyze_kernel，尝试底层 fallback"
 
   step_3_analyze_kernel:
     description: "分析 CUDA kernel 数学逻辑"
@@ -158,45 +193,75 @@ expected_return:
 
 ## 典型修复案例
 
-### Case 1: fused_swiglu_bwd
+### Case 1: fused_swiglu_bwd（存在上游退化路径）
 
 **错误**：
 ```
 NotImplementedError: fused_swiglu_bwd is not implemented for non-CUDA backends.
 ```
 
-**定位**：
-- Python 封装：`PaddleFleet/src/paddlefleet/fusions/fused_bias_swiglu.py:80-87`
-- CUDA kernel：`PaddleFleet/src/paddlefleet/_extensions/swiglu_kernel.cu`
+**Step 2b: 追溯调用链**
+- 报错点：`PaddleFleet/src/paddlefleet/fusions/fused_bias_swiglu.py:80-87`（swiglu_back）
+- 上一层：`bias_swiglu_impl()` / `BiasSwiGLUFunction.backward()`
+- 再上一层：`PaddleFleet/src/paddlefleet/transformer/mlp.py:196`
+  ```python
+  elif self.config.bias_activation_fusion:
+      # 走融合路径 → bias_swiglu_impl → swiglu_back → fused_swiglu_bwd (CUDA only)
+      intermediate_parallel = bias_swiglu_impl(...)
+  else:
+      # 走退化路径：纯 Python GLU，使用 paddle.chunk + F.silu + multiply
+      def glu(x):
+          x_glu, x_linear = paddle.chunk(x, 2, axis=-1)
+          return self.config.hidden_act(x_glu) * x_linear
+      intermediate_parallel = glu(intermediate_parallel)
+  ```
+- **结论**：上游 `else` 分支存在完整的非融合退化实现。
 
-**分析**：
-- Forward: `swiglu(y) = silu(y1) * y2`, where `y = [y1, y2]` along last dim
-- Backward:
-  - `dx1 = g * y2 * d_silu(y1)`
-  - `dx2 = g * silu(y1)`
-  - `dx = concat([dx1, dx2], axis=-1)`
+**Step 2c: 修改上游判断条件**
+- 修改 `mlp.py:196`：
+  ```python
+  # 修改前
+  elif self.config.bias_activation_fusion:
+  # 修改后
+  elif self.config.bias_activation_fusion and paddle.is_compiled_with_cuda():
+  ```
+- **效果**：非 CUDA 后端自动进入 `else` 分支的退化路径，完全避开 `fused_swiglu_bwd`。
+
+---
+
+### Case 2: xxx_op（无上游退化路径，需底层 fallback）
+
+**错误**：
+```
+NotImplementedError: xxx_op is not implemented for non-CUDA backends.
+```
+
+**Step 2b: 追溯调用链**
+- 报错点：`some_module.py:100`（xxx_op）
+- 向上追溯 2-3 层调用者
+- **结论**：所有调用路径均直接调用 xxx_op，无 else 分支的退化逻辑。
+
+**Step 3-4: 分析 kernel 并实现底层 fallback**
+（此处沿用原有的 analyze_kernel + implement_fallback 流程）
 
 **回退实现**：
 ```python
-def _fused_swiglu_bwd_fallback(g, y):
-    y1, y2 = paddle.chunk(y, chunks=2, axis=-1)
-    sig_y1 = paddle.nn.functional.sigmoid(y1)
-    silu_y1 = y1 * sig_y1
-    dx2 = g * silu_y1
-    d_silu = sig_y1 * (1.0 + y1 * (1.0 - sig_y1))
-    dx1 = g * y2 * d_silu
-    return paddle.concat([dx1, dx2], axis=-1)
+def _xxx_op_fallback(*args, **kwargs):
+    """XPU/CPU fallback for xxx_op using native Paddle APIs."""
+    # 使用 paddle.* 标准 API 实现等价逻辑
+    ...
+    return result
 ```
 
 **修改点**：
 ```python
 # 修改前
 else:
-    raise NotImplementedError("...")
+    raise NotImplementedError("xxx_op is not implemented for non-CUDA backends.")
 
 # 修改后
 else:
-    return _fused_swiglu_bwd_fallback(g, y)
+    return _xxx_op_fallback(*args, **kwargs)
 ```
 
 ---
@@ -263,6 +328,12 @@ class Test<Operator>Fallback(unittest.TestCase):
 **可修复的情况**：
 - CUDA-only fused operator 有明确的数学公式，可用 Paddle 标准 API 等价实现
 - Python 层对 CUDA 的判断是 `paddle.is_compiled_with_cuda()` 形式
+
+**上游退化路径的边界**：
+- 退化路径必须是**数学等价**的（输入输出语义一致），不能只处理部分 case
+- 退化路径的性能损失需可接受（多 kernel 调度 vs 单 fused kernel）
+- 若退化路径依赖上游配置参数（如 `gpt_model_use_experimental_version`），需确认该参数在当前框架版本中可用
+- 若上游修改会导致其他模型架构行为变化，需评估影响范围
 
 **不可修复的情况（返回 manual_required）**：
 - 算子涉及复杂的 CUDA-specific 内存操作、warp shuffle、tensor core 等，无法用标准 API 模拟
