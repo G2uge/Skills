@@ -185,6 +185,7 @@ target_skill = f"{skill_root}/setup-paddleformer-xpu-env/SKILL.md"
 | `{SKILL_ROOT}/convert-gpu-to-xpu-yaml/SKILL.md` | Step 2 目标 skill 1 | `/path/to/skills/convert-gpu-to-xpu-yaml/SKILL.md` |
 | `{SKILL_ROOT}/generate-xpu-launch-script/SKILL.md` | Step 2 目标 skill 2 | `/path/to/skills/generate-xpu-launch-script/SKILL.md` |
 | `{SKILL_ROOT}/run-xpu-training-with-monitor/SKILL.md` | Step 3 目标 skill | `/path/to/skills/run-xpu-training-with-monitor/SKILL.md` |
+| `{SKILL_ROOT}/orchestrate-xpu-validation/SKILL.md` | Step 5 目标 skill | `/path/to/skills/orchestrate-xpu-validation/SKILL.md` |
 
 ---
 
@@ -463,10 +464,10 @@ Step 0 完成后，主 Agent 必须持久化以下上下文：
 ```yaml
 session_memory:
   user_inputs:
-    model_name: "<用户提供的模型名称>"
-    gpu_yaml_path: "<用户提供的GPU yaml路径>"
-    model_path: "<用户提供的模型路径>"
-    dataset_source_path: "<用户提供的数据集路径>"
+    model_name: " "<用户提供的模型名称>"
+    gpu_yaml_path: " "<用户提供的GPU yaml路径>"
+    model_path: " "<用户提供的模型路径>"
+    dataset_source_path: " "<用户提供的数据集路径>"
 
   workspace:
     BASE_DIR: "/root/paddlejob/tmp"
@@ -475,6 +476,13 @@ session_memory:
     DATASETS_DIR: "/root/paddlejob/tmp/datasets"
     OUTPUT_DIR: "/root/paddlejob/tmp/output"
     REPOS_DIR: "/root/paddlejob/tmp/repos"
+
+  # 动态计算路径（基于 dataset_source_path 的 basename）
+  computed_paths:
+    dataset_folder_name: " "<dataset_source_path 的文件夹名>"
+    dataset_workspace_path: "/root/paddlejob/tmp/datasets/<文件夹名>"
+    train_dataset_path: " "<将原始 train_dataset_path 前缀替换为 dataset_workspace_path>"
+    eval_dataset_path: " "<将原始 eval_dataset_path 前缀替换为 dataset_workspace_path>"
 
   generated_files:
     xpu_yaml: "/root/paddlejob/tmp/output/xpu_config.yaml"
@@ -585,10 +593,10 @@ mkdir -p /root/paddlejob/tmp/{paddle,datasets,output,repos}
 
 ```bash
 # 复制 GPU yaml 文件
-cp ${gpu_yaml_path} /root/paddlejob/tmp/datasets/gpu_config.yaml
+cp "${gpu_yaml_path}" /root/paddlejob/tmp/datasets/gpu_config.yaml
 
-# 复制训练数据集
-cp -r ${dataset_source_path}/* /root/paddlejob/tmp/datasets/
+# 复制训练数据集（保留原始文件夹名称）
+cp -r "${dataset_source_path}" /root/paddlejob/tmp/datasets/
 ```
 
 ### 1.3 安装 Paddle-XPU、PaddleFleet、PaddleFormer 环境
@@ -700,8 +708,9 @@ params_optional:
   reference_yaml: null
   num_xpus: 8
   xpu_devices: "0,1,2,3,4,5,6,7"
-  train_dataset_path: "<用户提供的训练模型路径>"
-  eval_dataset_path:"<用户提供的验证模型路径>"
+  # 数据集路径：主 Agent 已将原始路径映射到工作空间路径
+  train_dataset_path: "/root/paddlejob/tmp/datasets/<dataset_folder_name>/train.jsonl"
+  eval_dataset_path: "/root/paddlejob/tmp/datasets/<dataset_folder_name>/val2.jsonl"
 
 # 特殊要求（主 Agent 对当前 SubAgent 的额外约束）
 special_requirements:
@@ -739,10 +748,10 @@ inputs:
   gpu_yaml_path: "/root/paddlejob/tmp/datasets/gpu_config.yaml"
   output_path: "/root/paddlejob/tmp/output/xpu_config.yaml"
   reference_yaml: null  # 可选，如有参考配置则传入
-  # 路径覆盖参数（覆盖 GPU YAML 中的硬编码路径）
+  # 路径覆盖参数（覆盖 GPU YAML 中的硬编码路径，使用工作空间内的映射路径）
   model_path: "/root/paddlejob/zhangxiao_dev/data/Qwen3-VL-30B-A3B-Thinking"
-  train_dataset_path: "/root/paddlejob/Gruge/data/coco_grounding/train.jsonl"
-  eval_dataset_path: "/root/paddlejob/Gruge/data/coco_grounding/val2.jsonl"
+  train_dataset_path: "/root/paddlejob/tmp/datasets/coco_grounding/train.jsonl"
+  eval_dataset_path: "/root/paddlejob/tmp/datasets/coco_grounding/val2.jsonl"
 ```
 
 **输出**：
@@ -1249,9 +1258,9 @@ special_requirements:
 ```yaml
 skill_invocation:
   required: true
-  skill_name: "validate-xpu-gpu-training"
-  skill_path: "{SKILL_ROOT}/validate-xpu-gpu-training/SKILL.md"
-  note: "本 Step 调用精度验证 Skill，对 XPU 训练结果与 GPU 基准进行全面对比验证"
+  skill_name: "orchestrate-xpu-validation"
+  skill_path: "{SKILL_ROOT}/orchestrate-xpu-validation/SKILL.md"
+  note: "本 Step 调用精度验证调度 Skill，由其编排早期门控、轮询等待、最终验证的完整流程"
 ```
 
 ### 最小上下文传递
@@ -1262,7 +1271,7 @@ skill_invocation:
 # 动态参数（验证需要的目录路径）
 params_required:
   xpu_log_path: "/root/paddlejob/tmp/output/paddleformers_dist_log/workerlog.0"
-  gpu_log_path: "<GPU 训练 workerlog.0 路径>"
+  gpu_log_path: " "<GPU 训练 workerlog.0 路径>"
   output_dir: "/root/paddlejob/tmp/output"
 
   # 阈值配置（可选，使用 Skill 默认值）
@@ -1276,8 +1285,16 @@ params_required:
     r2: 0.98
 
   # 模型信息（可选，用于报告标注）
-  model_name: "<模型名称>"
-  model_type: "<模型类型>"
+  model_name: " "<模型名称>"
+  model_type: " "<模型类型>"
+
+# 可选参数（使用 Skill 默认值）
+params_optional:
+  early_gate_max_steps: 10
+  early_gate_min_steps: 3
+  wait_poll_interval: 30
+  wait_max_duration: 86400
+  wait_stuck_timeout: 300
 
 # 特殊要求（主 Agent 对当前 SubAgent 的额外约束）
 special_requirements:
@@ -1298,7 +1315,7 @@ execution_flow:
       skill_path = f"{SKILL_ROOT}/validate-xpu-gpu-training/SKILL.md"
 
   step_2_invoke_validation_skill:
-    action: "调用 validate-xpu-gpu-training Skill"
+    action: "调用 orchestrate-xpu-validation Skill"
     method: "使用 Skill 工具调用"
     params:
       - xpu_log_path
@@ -1307,14 +1324,24 @@ execution_flow:
       - thresholds
       - model_name
       - model_type
+      - early_gate_max_steps
+      - early_gate_min_steps
+      - wait_poll_interval
+      - wait_max_duration
+      - wait_stuck_timeout
     note: |
-      验证 Skill 内部完成：
-      1. 从 XPU/GPU 日志提取结构化数据
-      2. 数据清洗与对齐
-      3. 分别绘制 XPU/GPU 单端曲线（单调性/平滑度/收敛性分析）
-      4. 双端曲线叠加对比（Overlay / Delta / 相对误差 / 散点对齐）
-      5. 计算 7 项量化评估指标（MAE/RMSE/MaxDiff/Pearson/Spearman/R²/RelativeError%）
-      6. 生成 report.json 和 report.md
+      调度 Skill 内部编排：
+      1. 阶段1：调用 validate-xpu-gpu-training (early_only) 做初步校验
+         - 有 GPU 数据：双端 Loss 对比（MAE + Pearson）
+         - 无 GPU 数据：XPU 单端自检验（单调性 + 平滑度）
+         - Early Fail 立即终止，不等训练完成
+      2. 阶段2：阻塞轮询等待训练完成
+         - 检测完成标志、卡住、超时
+      3. 阶段3：调用 validate-xpu-gpu-training (final_only) 做完整验证
+         - 数据提取/清洗/对齐
+         - 单端趋势分析 + 双端对比
+         - 计算 7 项量化指标
+         - 生成完整报告
 
   step_3_return_result:
     action: "将验证 Skill 的返回结果直接传递给主 Agent"
@@ -1386,54 +1413,41 @@ validation_result:
 
 ## 返回格式
 
-SubAgent-5 直接返回 `validate-xpu-gpu-training` Skill 的结果，格式如下：
+SubAgent-5 直接返回 `orchestrate-xpu-validation` Skill 的结果，格式如下：
 
 ```json
 {
-  "验证状态": "Pass | Warn | Fail",
-  "验证报告路径": "<report.json 路径>",
-  "验证详情": {
-    "数据对齐": {
-      "xpu_total_steps": 30,
-      "gpu_total_steps": 30,
-      "aligned_steps": 30
+  "调度状态": "Success | Fail",
+  "阶段执行记录": {
+    "early_gate": {
+      "executed": true,
+      "status": "Pass | Warn | Fail",
+      "mode": "dual_side | single_side_only",
+      "steps_used": 8,
+      "metrics": {
+        "mae": 0.03,
+        "pearson": 0.998
+      },
+      "report_path": "<output_dir>/orchestrate-xpu-validation/early_gate/validate-xpu-gpu-training/report.json"
     },
-    "单端分析": {
-      "XPU": {"loss_monotonicity": -0.98, "convergence_pass": true},
-      "GPU": {"loss_monotonicity": -0.97, "convergence_pass": true}
+    "wait_training": {
+      "executed": true,
+      "waited_seconds": 3600,
+      "completed_by": "train_runtime pattern",
+      "stuck_detected": false,
+      "timeout_detected": false
     },
-    "双端对比": {
-      "mae": 0.012,
-      "rmse": 0.018,
-      "max_diff": 0.038,
-      "pearson": 0.9998,
-      "spearman": 0.9999,
-      "relative_error_percent": 0.85,
-      "r2": 0.9996,
-      "criteria_check": {
-        "mae_pass": true,
-        "rmse_pass": true,
-        "max_diff_pass": true,
-        "pearson_pass": true,
-        "spearman_pass": true,
-        "relative_error_pass": true,
-        "r2_pass": true
-      }
+    "final_validation": {
+      "executed": true,
+      "status": "Pass | Warn | Fail | single_side_only",
+      "validation_tier": "full_analysis",
+      "report_path": "<output_dir>/orchestrate-xpu-validation/final/validate-xpu-gpu-training/report.json"
     }
   },
-  "输出文件": {
-    "plots": {
-      "xpu_training_curves": "<路径>",
-      "gpu_training_curves": "<路径>",
-      "xpu_gpu_overlay": "<路径>",
-      "xpu_gpu_delta": "<路径>",
-      "xpu_gpu_relative_error": "<路径>",
-      "xpu_gpu_scatter": "<路径>"
-    },
-    "reports": {
-      "report_json": "<路径>",
-      "report_md": "<路径>"
-    }
+  "最终结果": {
+    "validation_status": "Pass | Warn | Fail | single_side_only",
+    "final_report_path": "<output_dir>/orchestrate-xpu-validation/final/validate-xpu-gpu-training/report.json",
+    "plots_dir": "<output_dir>/orchestrate-xpu-validation/final/validate-xpu-gpu-training/plots/"
   },
   "failure_summary": "<验证失败原因>"
 }
@@ -1539,10 +1553,10 @@ subagent_prompt: |
   - python_env_path: {python_env_path}
   - output_dir: {output_dir}
   - model_name: {model_name}
-  # 路径覆盖参数（用于覆盖 GPU YAML 中的硬编码路径）
+  # 路径覆盖参数（用于覆盖 GPU YAML 中的硬编码路径，使用工作空间映射路径）
   - model_path: {model_path}
-  - train_dataset_path: {train_dataset_path}
-  - eval_dataset_path: {eval_dataset_path}
+  - train_dataset_path: {train_dataset_path}   # 格式: /root/paddlejob/tmp/datasets/<dataset_folder_name>/train.jsonl
+  - eval_dataset_path: {eval_dataset_path}     # 格式: /root/paddlejob/tmp/datasets/<dataset_folder_name>/val.jsonl
 
   【★ 特殊要求处理（如有）】
   {SPECIAL_REQUIREMENTS_BLOCK}
@@ -1722,43 +1736,60 @@ subagent_prompt: |
 ## SubAgent-5 Prompt 模板（含特殊要求处理）
 
 ```yaml
-subagent_description: "Step5: 验证"
+subagent_description: "Step5: 精度验证调度"
 
 subagent_prompt: |
-  你是 SubAgent-5，职责：执行 Step 5 验证。
+  你是 SubAgent-5，职责：执行 Step 5 精度验证调度。
+
+  【强制指令 - 必须遵守】
+  你必须调用 Skill: orchestrate-xpu-validation
+
+  【路径定位】
+  1. 当前 skill 文件位置：{CURRENT_SKILL_PATH}
+  2. SKILL_ROOT = {CURRENT_SKILL_PATH} 的父目录的父目录
+  3. 目标 Skill 路径：{SKILL_ROOT}/orchestrate-xpu-validation/SKILL.md
 
   【主 Agent 传递的参数】
+  - xpu_log_path: {xpu_log_path}
+  - gpu_log_path: {gpu_log_path}
   - output_dir: {output_dir}
-  - checkpoints_dir: {checkpoints_dir}
-  - logs_dir: {logs_dir}
+  - thresholds: {thresholds}
+  - model_name: {model_name}
+  - model_type: {model_type}
+  - early_gate_max_steps: {early_gate_max_steps}
+  - early_gate_min_steps: {early_gate_min_steps}
+  - wait_poll_interval: {wait_poll_interval}
+  - wait_max_duration: {wait_max_duration}
+  - wait_stuck_timeout: {wait_stuck_timeout}
 
   【★ 特殊要求处理（如有）】
   {SPECIAL_REQUIREMENTS_BLOCK}
-  # 示例：要求验证额外的指标
-  # 示例：要求生成特定格式的验证报告
-  # 示例：要求将验证结果导出到特定位置
 
   【你的执行流程】
-  1. 处理 special_requirements
-     - 如 constraints 指定了额外验证项
-     - 如 overrides 指定了验证阈值
-  2. 检查训练是否正常输出 loss
-  3. 输出 loss 曲线
-  4. 检查训练稳定性
-  5. 验证输出目录文件完整性
-  6. 执行额外验证项（如有）
-  7. 返回验证结果，包含 special_requirements_status
+  1. 使用 Read 工具读取 orchestrate-xpu-validation Skill 文件
+  2. 检查特殊要求与 Skill 约束的兼容性
+  3. 使用 Skill 工具调用：skill: "orchestrate-xpu-validation"
+     - 传递所有主 Agent 给的参数
+     - 遵守 constraints
+  4. 等待调度器返回完整结果（包含 Early + Wait + Final 三阶段汇总）
+     - 注意：调度器内部会阻塞轮询训练完成，可能耗时较长
+  5. 透明返回结果给主 Agent，不做额外处理或转换
 
-  【验证项】
-  - checkpoints_dir 是否有模型保存
-  - logs_dir 是否有日志文件生成
-  - training_stable 训练是否稳定
-  - loss_detected 是否检测到 loss 输出
-  - 【特殊要求添加的验证项】
+  【注意】
+  orchestrate-xpu-validation 内部编排逻辑：
+  - 阶段1：调用 validate-xpu-gpu-training (early_only) 做初步校验
+    - 有 GPU：双端 MAE + Pearson
+    - 无 GPU：XPU 单端单调性 + 平滑度
+    - Early Fail 时立即返回，不进入等待
+  - 阶段2：阻塞轮询等待训练完成
+  - 阶段3：调用 validate-xpu-gpu-training (final_only) 做完整验证
+
+  你只需调用 orchestrate-xpu-validation 一次，等待其返回最终结果。
 
   【约束】
-  - 本 Step 不调用外部 Skill，直接执行验证逻辑
-  - 返回标准格式的 JSON 结果
+  - 必须调用 orchestrate-xpu-validation Skill，不得直接调用 validate-xpu-gpu-training
+  - 必须透明返回调度器结果，不做额外处理
+  - 返回结果包含 special_requirements_status
 ```
 
 ---
