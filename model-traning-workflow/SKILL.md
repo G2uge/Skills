@@ -184,6 +184,7 @@ target_skill = f"{skill_root}/setup-paddleformer-xpu-env/SKILL.md"
 | `{SKILL_ROOT}/setup-paddleformer-xpu-env/SKILL.md` | Step 1 目标 skill | `/path/to/skills/setup-paddleformer-xpu-env/SKILL.md` |
 | `{SKILL_ROOT}/convert-gpu-to-xpu-yaml/SKILL.md` | Step 2 目标 skill 1 | `/path/to/skills/convert-gpu-to-xpu-yaml/SKILL.md` |
 | `{SKILL_ROOT}/generate-xpu-launch-script/SKILL.md` | Step 2 目标 skill 2 | `/path/to/skills/generate-xpu-launch-script/SKILL.md` |
+| `{SKILL_ROOT}/prune-model-layers/SKILL.md` | Step 2.5 目标 skill | `/path/to/skills/prune-model-layers/SKILL.md` |
 | `{SKILL_ROOT}/run-xpu-training-with-monitor/SKILL.md` | Step 3 目标 skill | `/path/to/skills/run-xpu-training-with-monitor/SKILL.md` |
 | `{SKILL_ROOT}/orchestrate-xpu-validation/SKILL.md` | Step 5 目标 skill | `/path/to/skills/orchestrate-xpu-validation/SKILL.md` |
 
@@ -351,6 +352,11 @@ subagent_execution_flow:
 ││<────────── 返回配置处理结果 ───────────────────────────────│
 │
 │
+│  ───────────── 启动 SubAgent-2.5 ──────────────>             │
+│                         (Step 2.5: 层配置控制)                │
+││<────────── 返回层配置结果（pruned/full）───────────────────│
+│
+│
 │  ───────────── 启动 SubAgent-3 ────────────────>             │
 │                         (Step 3: 模型执行)                    │
 ││<────────── 返回执行结果 ───────────────────────────────────│
@@ -370,21 +376,39 @@ subagent_execution_flow:
 
 ## 循环机制
 
-Step3～Step5 存在循环关系：
+Step3～Step5 存在循环关系，分为两个阶段：
+
+### 阶段一：减层快速验证（pruned phase）
 
 ```text
-模型执行失败
+模型执行（减层）
    ↓
-问题修复
+失败 → 问题修复 → 重新执行（保持减层）
    ↓
-重新执行
-   ↓
-再次验证
+成功 → 触发恢复全量 → 进入阶段二
 ```
+
+### 阶段二：全量正式训练（full phase）
+
+```text
+模型执行（全量）
+   ↓
+失败 → 问题修复 → 重新执行（保持全量）
+   ↓
+成功 → 进入 Step 5 验证
+```
+
+### 恢复触发条件
+
+当 `current_phase == "pruned"` 且 Step 3 成功时：
+- 主 Agent 标记 `need_restore = true`
+- 重新启动 SubAgent-2.5（action=restore）恢复全量配置
+- 恢复后 `current_phase` 更新为 `"full"`
+- 重新启动 SubAgent-3 执行全量训练
 
 直到：
 
-> **验证通过后结束流程**
+> **全量训练成功并通过 Step 5 验证后结束流程**
 
 ---
 
@@ -487,6 +511,29 @@ session_memory:
   generated_files:
     xpu_yaml: "/root/paddlejob/tmp/output/xpu_config.yaml"
     launch_script: "/root/paddlejob/tmp/output/train_xpu.sh"
+
+  # 减层控制状态（用于两阶段训练：减层冒烟 → 恢复全量）
+  layer_pruning:
+    enabled: true               # 开关，默认启用。可通过 special_requirements 传入 false 关闭
+    mode: "extreme_fast"        # 减层模式：extreme_fast | fast | balanced
+    component: "auto"           # 作用范围：auto | all | {具体字段路径}
+    current_phase: null         # 当前阶段：null | pruned | full
+    is_restored: false          # 是否已完成从 pruned 到 full 的恢复
+    need_restore: false         # 标记：减层跑通后需要触发恢复
+
+  # ★ YAML 修改记录（由 Step 3 训练过程产生，用于 Step 2.5 恢复时参考）
+  yaml_fixes:
+    # 结构示例（由 SubAgent-3 在训练过程中动态填充）
+    # - field: "recompute_num_layers"
+    #   from: 11
+    #   to: 7
+    #   reason: "减层联动：recompute_num_layers <= chunk_size"
+    #   restore_on_full: true      # 全量恢复时是否需要恢复该字段
+    # - field: "pipeline_model_parallel_size"
+    #   from: 4
+    #   to: 1
+    #   reason: "环境限制：world_size 与并行度不匹配"
+    #   restore_on_full: false     # 环境限制类修改，全量时保持
 ```
 
 ## 校验约束
@@ -804,6 +851,128 @@ inputs:
 
 ---
 
+# Step 2.5：层配置控制
+
+---
+
+## 执行者
+
+> SubAgent-2.5
+
+---
+
+### 强制调用声明
+
+```yaml
+skill_invocation:
+  required: true
+  skill_name: "prune-model-layers"
+  skill_path: "{SKILL_ROOT}/prune-model-layers/SKILL.md"
+```
+
+### 最小上下文传递
+
+主 Agent 创建 SubAgent-2.5 时，**仅传递**：
+
+```yaml
+# 动态参数（必需）
+params_required:
+  model_path: "<用户提供的模型路径>"
+  action: "prune | restore"     # 主 Agent 告知本次操作类型
+  mode: "extreme_fast"          # action=prune 时生效
+  component: "auto"
+
+# 可选参数
+params_optional:
+  backup_path: null             # action=restore 时，如已知备份路径可传入
+
+  # ★ YAML 联动恢复参数（仅在 action=restore 时生效）
+  xpu_yaml_path: null           # XPU YAML 配置文件路径，恢复时同步修复 YAML
+  yaml_restore_overrides: {}    # YAML 恢复字段映射，如 {recompute_num_layers: 11}
+  yaml_keep_as_is: []           # YAML 中保持不变的字段列表（环境限制类修改）
+
+# 特殊要求
+special_requirements:
+  description: "主 Agent 对本 Step 的特殊要求说明"
+  constraints: []
+  overrides: {}
+  priority: "normal"
+```
+
+### SubAgent-2.5 执行流程
+
+1. **确定 SKILL_ROOT**：根据当前 skill 文件位置推算父目录
+2. **读取 Skill**：`Read {SKILL_ROOT}/prune-model-layers/SKILL.md`
+3. **根据 action 调用 Skill**：
+   - `action == "prune"`：调用 `prune-model-layers --mode extreme_fast`
+   - `action == "restore"`：调用 `prune-model-layers --mode full`
+4. **返回结果**：按 Skill 定义的 JSON 格式返回
+
+### 主 Agent 调度逻辑
+
+```yaml
+layer_pruning_gate:
+  logic:
+    - if: "layer_pruning.enabled == false"
+      action: "跳过 SubAgent-2.5，直接进入 Step 3"
+
+    - elif: "current_phase == 'pruned' AND need_restore == true"
+      action: "启动 SubAgent-2.5，action=restore"
+      params:
+        # ★ 传递 YAML 恢复参数（来自 Step 3 记录的 yaml_fixes_history）
+        xpu_yaml_path: "/root/paddlejob/tmp/output/xpu_config.yaml"
+        yaml_restore_overrides: "<来自 Step 3 的 yaml_fixes 记录（仅减层联动修改）>"
+        yaml_keep_as_is: "<环境限制类字段列表，保持当前值不变>"
+      next: "恢复后 current_phase='full'，is_restored=true，重新进入 Step 3"
+
+    - elif: "current_phase == null"
+      action: "启动 SubAgent-2.5，action=prune"
+      next: "设置 current_phase='pruned'，进入 Step 3"
+
+    - else:
+      action: "current_phase 已确定且无需恢复，跳过 SubAgent-2.5，直接进入 Step 3"
+```
+
+---
+
+## 返回格式
+
+```json
+{
+  "层配置处理": "Success | Fail",
+  "action": "prune | restore",
+  "current_phase": "pruned | full",
+  "backup_path": "config.json.bak.xxx",
+  "prune_result": {
+    "original_layers": 36,
+    "target_layers": 6,
+    "components_modified": 1
+  },
+  "yaml_restore": {
+    "status": "Success | Fail | NotRequired",
+    "yaml_path": "/root/paddlejob/tmp/output/xpu_config.yaml",
+    "fields_restored": [
+      {
+        "field": "recompute_num_layers",
+        "from": 7,
+        "to": 11,
+        "reason": "减层联动恢复"
+      }
+    ],
+    "fields_kept": [
+      {
+        "field": "pipeline_model_parallel_size",
+        "value": 1,
+        "reason": "环境限制：8 卡 world_size 不匹配 PP=4"
+      }
+    ]
+  },
+  "failure_summary": "<失败原因>"
+}
+```
+
+---
+
 # Step 3：模型执行
 
 ---
@@ -863,6 +1032,8 @@ params_required:
   config_file: "/root/paddlejob/tmp/output/xpu_config.yaml"
   python_env_path: "/root/paddlejob/tmp/paddle"
   output_dir: "/root/paddlejob/tmp/output"
+  training_phase: "pruned | full"    # 来自 SubAgent-2.5，标记当前训练阶段
+  is_restored_run: false             # 是否为恢复全量后的重新运行
 
 # 可选参数（使用 Skill 默认值）
 params_optional:
@@ -923,6 +1094,11 @@ inputs:
 - **自动识别并修复 YAML 配置错误**：若检测到 YAML 错误，自动修改 `/root/paddlejob/tmp/output/xpu_config.yaml` 并重试
 - **其他错误直接抛出**：OOM、运行时错误等不可修复错误直接返回失败
 - **⚠️ 重要限制**：仅允许修改 YAML 和 Shell 脚本文件，禁止修改 Python 源码、模型文件等
+- **★ YAML 修改记录**：所有 YAML 修改必须记录在 `yaml_fixes` 中，标注 `restore_on_full` 标记（true=全量恢复时需恢复，false=环境限制类保持）
+
+**阶段切换说明**：
+- 当 `training_phase == "pruned"` 且训练成功时，返回中设置 `trigger_restore: true`，主 Agent 据此触发恢复全量
+- 当 `training_phase == "full"` 且训练成功时，正常进入 Step 5 精度验证
 
 ---
 
@@ -988,12 +1164,44 @@ inputs:
 ```json
 {
   "模型运行状态": "Success | Fail",
+  "training_phase": "pruned | full",
+  "trigger_restore": false,
   "训练详情": {
     "launch_script": "/root/paddlejob/tmp/output/train_xpu.sh",
     "config_file": "/root/paddlejob/tmp/output/xpu_config.yaml",
     "output_dir": "/root/paddlejob/tmp/output/checkpoints",
     "retry_count": 0,
-    "yaml_fixed": false
+    "yaml_fixed": false,
+    "yaml_fixes": [
+      {
+        "field": "pipeline_model_parallel_size",
+        "from": 4,
+        "to": 1,
+        "reason": "环境限制：world_size 与并行度不匹配",
+        "restore_on_full": false
+      },
+      {
+        "field": "recompute_num_layers",
+        "from": 11,
+        "to": 7,
+        "reason": "减层联动：recompute_num_layers <= chunk_size",
+        "restore_on_full": true
+      },
+      {
+        "field": "using_sonic_moe",
+        "from": true,
+        "to": false,
+        "reason": "环境限制：sonicmoe 算子未编译",
+        "restore_on_full": false
+      },
+      {
+        "field": "apply_rope_fusion",
+        "from": true,
+        "to": false,
+        "reason": "环境限制：fused_rope 不支持 partial_rotary",
+        "restore_on_full": false
+      }
+    ]
   },
   "failure_summary": "<运行失败原因>",
   "escalation": {
@@ -1457,7 +1665,15 @@ SubAgent-5 直接返回 `orchestrate-xpu-validation` Skill 的结果，格式如
 
 # 八、最终输出规范（主 Agent 汇总）
 
-主 Agent 汇总所有步骤结果，统一输出：
+主 Agent 汇总所有步骤结果，统一输出。
+
+步骤结果包含 6 个子结果：
+- Step1: 环境搭建
+- Step2: 模型配置处理
+- Step2_5: 层配置控制（减层/恢复，仅 layer_pruning.enabled=true 时存在）
+- Step3: 模型执行
+- Step4: 问题修复（如有）
+- Step5: 精度验证
 
 ```json
 {
@@ -1471,10 +1687,19 @@ SubAgent-5 直接返回 `orchestrate-xpu-validation` Skill 的结果，格式如
   "步骤结果": [
     Step1,
     Step2,
+    Step2_5,
     Step3,
     Step4,
     Step5
   ],
+  "layer_pruning": {
+    "enabled": true,
+    "pruned_phase_completed": true,
+    "full_phase_completed": true,
+    "restored": true,
+    "pruned_training_verified": true,
+    "full_training_verified": true
+  },
   "最终总结": "<整体执行摘要>"
 }
 ```
@@ -1599,6 +1824,10 @@ subagent_prompt: |
   - config_file: {config_file}
   - python_env_path: {python_env_path}
   - output_dir: {output_dir}
+
+  # 减层阶段信息
+  - training_phase: {training_phase}         # pruned | full，来自 SubAgent-2.5
+  - is_restored_run: {is_restored_run}       # true | false，是否为恢复后的重新运行
 
   【★ 特殊要求处理（如有）】
   {SPECIAL_REQUIREMENTS_BLOCK}
@@ -1790,6 +2019,64 @@ subagent_prompt: |
   - 必须调用 orchestrate-xpu-validation Skill，不得直接调用 validate-xpu-gpu-training
   - 必须透明返回调度器结果，不做额外处理
   - 返回结果包含 special_requirements_status
+```
+
+## SubAgent-2.5 Prompt 模板（含特殊要求处理）
+
+```yaml
+subagent_description: "Step2.5: 层配置控制"
+
+subagent_prompt: |
+  你是 SubAgent-2.5，职责：执行模型减层或恢复操作。
+
+  【强制指令 - 必须遵守】
+  你必须调用 Skill: prune-model-layers
+
+  【路径定位】
+  1. 当前 skill 文件位置：{CURRENT_SKILL_PATH}
+  2. SKILL_ROOT = {CURRENT_SKILL_PATH} 的父目录的父目录
+  3. 目标 Skill 路径：{SKILL_ROOT}/prune-model-layers/SKILL.md
+
+  【主 Agent 传递的参数】
+  - model_path: {model_path}
+  - action: {action}              # prune 或 restore
+  - mode: {mode}                  # action=prune 时生效
+  - component: {component}
+
+  # ★ YAML 联动恢复参数（仅在 action=restore 时生效）
+  - xpu_yaml_path: {xpu_yaml_path}                     # XPU YAML 配置文件路径
+  - yaml_restore_overrides: {yaml_restore_overrides}   # 需要恢复的字段映射
+  - yaml_keep_as_is: {yaml_keep_as_is}                 # 保持不变的字段列表
+
+  【★ 特殊要求处理（如有）】
+  {SPECIAL_REQUIREMENTS_BLOCK}
+
+  【你的执行流程】
+  1. 确定 SKILL_ROOT：根据 CURRENT_SKILL_PATH 计算父目录的父目录
+  2. 读取 Skill 文件：{SKILL_ROOT}/prune-model-layers/SKILL.md
+  3. 根据 action 调用 Skill：
+     - action == "prune"：调用 `prune-model-layers --mode extreme_fast`
+       * 仅修改 config.json，不涉及 YAML
+     - action == "restore"：调用 `prune-model-layers --mode full`
+       * 恢复 config.json 层数
+       * 同时读取 xpu_yaml_path，应用 yaml_restore_overrides 恢复 YAML 联动字段
+       * yaml_keep_as_is 中列出的字段保持不变（环境限制类修改）
+  4. 验证 YAML 语法正确性（如 action=restore 且涉及 YAML 修改）
+  5. 返回结果给主 Agent，包含：
+     - current_phase（pruned | full）
+     - config_json_restore 状态
+     - yaml_restore 状态（含 fields_restored 和 fields_kept）
+
+  【约束】
+  - 必须调用 prune-model-layers Skill，禁止直接修改 config.json
+  - action=restore 时，必须同步处理 YAML 联动恢复
+  - 必须透明返回 Skill 结果，不修改结果结构
+  - 返回结果包含 special_requirements_status
+
+  【YAML 恢复原则】
+  - 仅恢复因减层引入的联动修改（如 recompute_num_layers）
+  - 环境限制类修改（如 pipeline_model_parallel_size、using_sonic_moe）必须保持当前值
+  - 恢复后必须验证 YAML 语法正确性
 ```
 
 ---
