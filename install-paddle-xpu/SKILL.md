@@ -118,6 +118,18 @@ python -m pip install --upgrade pip
 Then build and install paddlepaddle-xpu from source:
 ```bash
 cd ${REPOS_DIR}/Paddle
+
+# 【关键】确保第三方子模块已初始化
+git submodule update --init --recursive
+
+# 【关键】清理可能损坏的 XPU SDK 缓存
+if [ -d "build/third_party/xpu/src/extern_xpu" ]; then
+  if find "build/third_party/xpu/src/extern_xpu" -name "*.tar.gz" -size -1k | grep -q .; then
+    echo "[WARN] Found corrupted XPU SDK cache, cleaning..."
+    rm -rf build/third_party/xpu
+  fi
+fi
+
 mkdir -p build && cd build
 
 export {http,https}_proxy=http://10.63.229.53:8891
@@ -136,9 +148,12 @@ cmake .. -DPY_VERSION=3.10 \
 -DBUILD_WHL_PACKAGE=ON \
 -DWITH_DISTRIBUTE=ON \
 -DARCH_BIN_CONTAINS_90=1
-make -j$(nproc) TARGET=HASWELL
 
-python -m pip install python/dist/paddlepaddle-*.whl -i https://pypi.tuna.tsinghua.edu.cn/simple 
+# 编译并保存日志
+BUILD_LOG="build_$(date +%Y%m%d_%H%M%S).log"
+make -j$(nproc) TARGET=HASWELL 2>&1 | tee -a "${BUILD_LOG}"
+
+python -m pip install python/dist/paddlepaddle-*.whl -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout 120 --retries 3
 ```
 
 ### Step 3: Verify Installation
@@ -180,16 +195,31 @@ bash install_paddle_xpu.sh
 Script content:
 ```bash
 #!/bin/bash
-set -e
+set -euo pipefail
+
+REPOS_DIR="${REPOS_DIR:-/root/paddlejob/tmp/repos}"
+VENV_DIR="${VENV_DIR:-/root/paddlejob/Gruge/Gruge_env/paddle}"
+PADDLE_REPO_URL="${PADDLE_REPO_URL:-https://github.com/PaddlePaddle/Paddle.git}"
 
 echo "==> Clone or update Paddle source"
 cd ${REPOS_DIR}
 if [ ! -d "Paddle" ]; then
-    git clone ${PADDLE_REPO_URL}
+    git clone --recursive ${PADDLE_REPO_URL} Paddle
     cd Paddle
 else
     cd Paddle
     git pull
+fi
+
+echo "==> Initialize git submodules"
+git submodule update --init --recursive
+
+echo "==> Clean corrupted XPU cache if any"
+if [ -d "build/third_party/xpu/src/extern_xpu" ]; then
+  if find "build/third_party/xpu/src/extern_xpu" -name "*.tar.gz" -size -1k | grep -q .; then
+    echo "[WARN] Found corrupted XPU SDK cache, cleaning..."
+    rm -rf build/third_party/xpu
+  fi
 fi
 
 echo "==> Enter virtualenv workspace"
@@ -221,9 +251,12 @@ cmake .. -DPY_VERSION=3.10 \
 -DBUILD_WHL_PACKAGE=ON \
 -DWITH_DISTRIBUTE=ON \
 -DARCH_BIN_CONTAINS_90=1
-make -j$(nproc) TARGET=HASWELL
 
-python -m pip install python/dist/paddlepaddle-*.whl -i https://pypi.tuna.tsinghua.edu.cn/simple 
+BUILD_LOG="build_$(date +%Y%m%d_%H%M%S).log"
+make -j$(nproc) TARGET=HASWELL 2>&1 | tee -a "${BUILD_LOG}"
+
+python -m pip install python/dist/paddlepaddle-*.whl \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout 120 --retries 3
 
 echo "==> Check paddle version"
 python -c "import paddle; paddle.version.show()"
@@ -297,6 +330,33 @@ Required behavior
 - Do not silently ignore installation failures.
 - Do not continue subsequent setup steps after dependency installation failure.
 - Always use fallback mirror retry before final failure.
+
+### 6. ThreadPool.h: No such file or directory
+**原因**：`git submodule` 未完全初始化，第三方头文件缺失。  
+**修复**：
+```bash
+cd ${REPOS_DIR}/Paddle
+git submodule update --init --recursive
+```
+
+### 7. extern_xpu tar 解压失败 / gzip: trailing garbage ignored
+**原因**：昆仑芯 XPU SDK 下载包损坏（网络波动导致）。  
+**修复**：
+```bash
+rm -rf ${REPOS_DIR}/Paddle/build/third_party/xpu
+cd ${REPOS_DIR}/Paddle/build
+make -j$(nproc) TARGET=HASWELL
+```
+
+### 8. 编译长时间无输出，无法判断进度
+**检查方法**：
+```bash
+# 查看实时对象文件增长
+watch -n 5 'find ${REPOS_DIR}/Paddle/build -name "*.o" | wc -l'
+
+# 查看后台进度监控日志
+tail -f ${REPOS_DIR}/Paddle/build/build_*.log.progress
+```
 
 ## Recommended Agent Behavior
 When using this skill, the agent should:

@@ -166,7 +166,12 @@ templates/xpu_train.sh.template
    ```bash
    export LD_LIBRARY_PATH=${PYTHON_ENV_PATH}/lib/python3.10/site-packages/paddle/libs/:${LD_LIBRARY_PATH}
    ```
-4. **验证启动命令**：确保生成的脚本包含 `paddleformers-cli train ${CONFIG_FILE}`，不包含 `paddle.distributed.launch` 或 `run_finetune.py`
+4. **确保脚本在工作目录正确切换后执行**：
+   在变量定义后、环境清理前添加 `cd ${OUTPUT_DIR}`，确保：
+   - 分布式日志 `paddleformers_dist_log` 创建在正确的目录下
+   - YAML 配置中的相对路径（如 `output_dir: ./checkpoints/...`）基于正确的工作目录解析
+   - 环境清理操作作用于正确的目录
+5. **验证启动命令**：确保生成的脚本包含 `paddleformers-cli train ${CONFIG_FILE}`，不包含 `paddle.distributed.launch` 或 `run_finetune.py`
 
 ---
 
@@ -212,6 +217,12 @@ chmod +x {output_script_path}
    ```bash
    [ -f {output_script_path} ] && [ -x {output_script_path} ] && echo "✅ 脚本可执行"
    ```
+
+4. **验证工作目录切换**：
+   ```bash
+   grep -q "cd \${OUTPUT_DIR}" {output_script_path} && echo "✅ 工作目录切换已配置" || echo "❌ 缺少工作目录切换"
+   ```
+   此验证确保脚本在执行任何操作前已切换到 `${OUTPUT_DIR}`。若缺少此命令，分布式日志（`paddleformers_dist_log`）和 YAML 中的相对路径可能创建在错误位置。
 
 **验证失败处理**：
 - 如果验证失败，必须删除生成的脚本并重新生成
@@ -306,3 +317,8 @@ EOF
 7. **验证环境**: 脚本启动时会验证 `PYTHON_ENV_PATH/bin/activate` 是否存在
 
 8. **必须验证生成结果**: 生成后必须检查脚本包含正确的启动命令，否则必须重新生成
+
+9. **工作目录切换（新增）**: 脚本必须在启动训练前执行 `cd ${OUTPUT_DIR}`。原因如下：
+   - Paddle 分布式框架根据相对路径 `log_dir: paddleformers_dist_log` 创建分布式日志（`workerlog.*`、`envlog.*`），若工作目录不正确，日志会创建在脚本执行时的当前目录而非预期的输出目录
+   - YAML 配置中的 `output_dir: ./checkpoints/...` 等相对路径也会基于当前工作目录解析，导致 checkpoint、tensorboard 日志等输出到错误位置
+   - 环境清理命令（如 `rm -rf ${OUTPUT_DIR}/paddleformers_dist_log`）虽然使用了绝对路径变量，但添加 `cd` 可以确保所有基于相对路径的操作都在预期目录下执行

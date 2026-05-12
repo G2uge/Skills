@@ -87,6 +87,32 @@ execution_flow:
   step_5_report:
     description: "输出 config.json 修改摘要"
 
+  step_5_5_stop_pruned_training:
+    description: "停止减层阶段的训练进程（仅在 mode=full 时执行）"
+    condition: "mode == 'full'"
+    action: |
+      1. 查找并终止与当前模型相关的训练进程：
+         - pkill -9 -f "paddleformers-cli" 2>/dev/null || true
+         - pkill -9 -f "launcher.py" 2>/dev/null || true
+         - ps -ef | grep -E "paddleformers|launcher" | grep -v grep | awk '{print $2}' | xargs -r kill -9 2>/dev/null || true
+         - 等待 5 秒确认进程已终止（轮询检查直到相关进程数为 0 或超时 15 秒）
+      2. 清理共享内存残留：
+         - for id in $(ipcs -m 2>/dev/null | awk '/0x/ {print $2}'); do ipcrm -m $id 2>/dev/null || true; done
+      3. 备份旧的分布式日志：
+         - 若 output_dir/paddleformers_dist_log 存在，将其重命名为 paddleformers_dist_log.pruned.{timestamp}
+         - 若 output_dir/train.log 存在，将其重命名为 train.log.pruned.{timestamp}
+      4. 清理 Paddle 分布式环境变量：
+         - unset PADDLE_ELASTIC_JOB_ID PADDLE_TRAINER_ENDPOINTS DISTRIBUTED_TRAINER_ENDPOINTS FLAGS_START_PORT PADDLE_ELASTIC_TIMEOUT
+      5. 等待端口释放（sleep 5）
+    note: |
+      **此步骤为强制步骤，不可跳过。**
+      当从减层阶段（pruned）恢复到全量阶段（full）时，减层训练进程可能仍在后台运行。
+      若不减层进程未清理，全量训练启动后将产生以下问题：
+      - 日志文件冲突（旧进程持续写入 workerlog.0）
+      - 进程误判（监控逻辑将旧进程误认为新启动的全量训练）
+      - XPU 设备/端口占用导致全量训练启动失败
+      执行此步骤后，必须验证相关进程已完全终止，方可继续后续全量训练监控。
+
   step_6_yaml_restore:
     description: "YAML 联动恢复（仅在 mode=full 且提供了 xpu_yaml_path 时执行）"
     condition: "mode == 'full' AND xpu_yaml_path is not null AND yaml_restore_overrides is not empty"

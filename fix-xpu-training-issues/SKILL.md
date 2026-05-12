@@ -26,6 +26,11 @@ inputs:
   log_path: " "<训练日志路径>"
   output_dir: " "<输出目录>"
   
+  # ★ OOM 诊断所需参数
+  # diagnose-xpu-oom 需要原始 GPU YAML 和模型路径来分析并行规模差距
+  gpu_yaml_path: null           # 原始 GPU YAML 配置文件路径
+  model_path: null              # 模型权重目录路径（需包含 config.json）
+  
   # 模型信息
   model_name: " "<模型名称>"
   model_type: " "<模型类型>"
@@ -33,8 +38,12 @@ inputs:
   # 可选
   gpu_reference_result: " "<GPU 参考结果>"
   max_fix_attempts: 3
-  previous_fixes: []
-  
+
+  # ★ 修复历史（用于同一问题推进检测）
+  # 格式: [{"attempt": 1, "issue_signature": "...", "error_message": "...", "fix_description": "...", "verify_result": "failed|loss_output", "timestamp": "..."}]
+  # 当同一 issue_signature 连续出现 3 次且无推进时，强制返回 manual_required 上报主 Agent
+  repair_history: []
+
   # 特殊要求
   special_requirements: {}
 ```
@@ -92,6 +101,19 @@ execution_flow:
            → 检查 fix-config-issues 是否存在
            → 若存在：调用 fix-config-issues
            → 若不存在：尝试 fix-generic-issues
+         - out_of_memory / oom / allocate_memory_failed / "Cannot allocate .* memory"
+           → 检查 diagnose-xpu-oom 是否存在（路径: {SKILL_ROOT}/diagnose-xpu-oom/SKILL.md）
+           → 若存在：
+               1. 调用 diagnose-xpu-oom，传入完整上下文（gpu_yaml_path, xpu_yaml_path, model_path, num_xpus, oom_log_path）
+               2. 等待诊断报告
+               3. 根据报告决策：
+                  - 若存在可行性="高"的降显存方案：
+                      → 将 diagnose 输出的"修改项"作为 fix-config-issues 的输入
+                      → 调用 fix-config-issues 执行精确 YAML 修改
+                  - 若所有方案可行性均为"低"或 diagnose 直接建议"减层/加卡"：
+                      → 标记 fix_status = "manual_required"
+                      → 不再尝试修复，直接进入 step_6_report 上报
+           → 若不存在：尝试 fix-generic-issues
          - accuracy / nan / inf
            → 检查 fix-accuracy-issues 是否存在
            → 若存在：调用 fix-accuracy-issues
@@ -135,8 +157,32 @@ execution_flow:
     note: "以是否输出 loss 作为修复成功的唯一标准"
   
   step_5_iterate:
-    description: "判断是否继续迭代"
+    description: "判断是否继续迭代（含同一问题推进检测）"
     logic: |
+      # ====== 5.1 提取本轮问题签名 ======
+      issue_signature = "{issue_category}:{hash(error_message_core + str(sorted(issue_features)))}"
+      # error_message_core 取 error_message 的前 120 个字符（去除数字、路径等易变部分）
+
+      # ====== 5.2 同一问题推进检测 ======
+      # 从修复历史中提取相同 issue_signature 的连续记录
+      same_signature_count = count_consecutive_same_signature(repair_history, issue_signature)
+
+      IF same_signature_count >= 3:
+        # 判定是否有推进
+        has_progress = check_progress(repair_history, last_n=3)
+        # 推进定义（满足任一即算有推进）：
+        #   a) 修复后进程运行时间比之前任何一次都长（≥1.5倍）
+        #   b) new_error 与上一轮的错误核心信息不同（不是同一类错误）
+        #   c) verify_result 从 "immediate_crash" 改善为 "ran_for_a_while"
+        #   d) 修复涉及的文件/字段与之前不同（尝试了不同修复策略）
+
+        IF NOT has_progress:
+          -> 跳转到 step_6_report
+          -> 标记 manual_required
+          -> 上报原因: "同一问题 ({issue_signature}) 连续 3 次修复无推进，怀疑存在根本性冲突或 Skill 修复策略无法覆盖该问题"
+          -> 在返回中附加建议: "请主 Agent 检查是否为框架级 Bug、硬件限制或需要更换模型/数据集"
+
+      # ====== 5.3 常规迭代判断 ======
       IF verify_result == "loss_output":
         -> 跳转到 step_6_report，标记成功
       ELSE IF fix_status == "manual_required":
@@ -144,7 +190,10 @@ execution_flow:
       ELSE IF current_attempt >= max_fix_attempts:
         -> 跳转到 step_6_report，标记 failed
       ELSE:
-        -> 更新 error_message 为新错误，current_attempt + 1，回到 step_1_classify
+        -> 记录本轮 {issue_signature, error_message, fix_description, verify_result} 到 repair_history
+        -> 更新 error_message 为新错误（如有 new_error）
+        -> current_attempt + 1
+        -> 回到 step_1_classify
   
   step_6_report:
     description: "汇总结果并返回"
@@ -225,6 +274,7 @@ def check_skill_exists(skill_name, skill_root):
     {
       "attempt": 1,
       "invoked_skill": " "<Skill 名称>",
+      "issue_signature": " "<问题签名，如 operator:fused_rotary_position_embedding>",
       "fix_description": " "<修复描述>",
       "training_result": "failed",
       "error_after_fix": " "<新错误>"
@@ -232,6 +282,7 @@ def check_skill_exists(skill_name, skill_root):
     {
       "attempt": 2,
       "invoked_skill": " "<Skill 名称>",
+      "issue_signature": " "<问题签名>",
       "fix_description": " "<修复描述>",
       "training_result": "success",
       "loss_output": true

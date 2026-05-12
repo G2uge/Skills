@@ -1271,6 +1271,10 @@ params_required:
   model_name: " "<模型名称>"
   model_type: " "<模型类型>"
   
+  # ★ OOM 诊断所需参数（传递给 diagnose-xpu-oom 做显存根因分析）
+  gpu_yaml_path: " "<原始 GPU YAML 路径，如 /root/paddlejob/tmp/datasets/gpu_config.yaml>"
+  model_path: " "<模型权重目录路径>"
+
   # 参考数据（可选）
   gpu_reference_result: " "<GPU 训练参考结果（精度对比用）>"
 
@@ -1928,6 +1932,10 @@ subagent_prompt: |
   - model_name: {model_name}
   - model_type: {model_type}
   - gpu_reference_result: {gpu_reference_result}
+
+  # ★ OOM 诊断所需参数（当遇到 OOM 错误时，fix-xpu-training-issues 会调用 diagnose-xpu-oom）
+  - gpu_yaml_path: {gpu_yaml_path}
+  - model_path: {model_path}
 
   【★ 特殊要求处理（如有）】
   {SPECIAL_REQUIREMENTS_BLOCK}
