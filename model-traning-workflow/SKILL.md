@@ -515,7 +515,7 @@ session_memory:
   # 减层控制状态（用于两阶段训练：减层冒烟 → 恢复全量）
   layer_pruning:
     enabled: true               # 开关，默认启用。可通过 special_requirements 传入 false 关闭
-    mode: "extreme_fast"        # 减层模式：extreme_fast | fast | balanced
+    mode: "auto"                # 减层模式：auto | extreme_fast | fast | balanced | full
     component: "auto"           # 作用范围：auto | all | {具体字段路径}
     current_phase: null         # 当前阶段：null | pruned | full
     is_restored: false          # 是否已完成从 pruned 到 full 的恢复
@@ -879,12 +879,16 @@ skill_invocation:
 params_required:
   model_path: "<用户提供的模型路径>"
   action: "prune | restore"     # 主 Agent 告知本次操作类型
-  mode: "extreme_fast"          # action=prune 时生效
+  mode: "auto"                  # action=prune 时生效，auto 由 skill 自主决策
   component: "auto"
 
 # 可选参数
 params_optional:
   backup_path: null             # action=restore 时，如已知备份路径可传入
+
+  # ★ 新增：智能决策所需上下文（mode=auto 时由 skill 消费）
+  train_config: null            # 训练配置文件路径，通常为 xpu_config.yaml，用于提取并行策略/batch/seq_len
+  hardware_context: null        # 硬件信息（device_type/world_size/per_device_memory），null 时 skill 自动探测
 
   # ★ YAML 联动恢复参数（仅在 action=restore 时生效）
   xpu_yaml_path: null           # XPU YAML 配置文件路径，恢复时同步修复 YAML
@@ -904,9 +908,9 @@ special_requirements:
 1. **确定 SKILL_ROOT**：根据当前 skill 文件位置推算父目录
 2. **读取 Skill**：`Read {SKILL_ROOT}/prune-model-layers/SKILL.md`
 3. **根据 action 调用 Skill**：
-   - `action == "prune"`：调用 `prune-model-layers --mode extreme_fast`
-   - `action == "restore"`：调用 `prune-model-layers --mode full`
-4. **返回结果**：按 Skill 定义的 JSON 格式返回
+   - `action == "prune"`：调用 `prune-model-layers`，传递 mode（auto 或手动指定）、train_config、hardware_context
+   - `action == "restore"`：调用 `prune-model-layers --mode full`，传递 YAML 联动恢复参数
+4. **返回结果**：按 Skill 定义的 JSON 格式返回，包含 `decision` 字段（auto 路径下）
 
 ### 主 Agent 调度逻辑
 
@@ -927,6 +931,10 @@ layer_pruning_gate:
 
     - elif: "current_phase == null"
       action: "启动 SubAgent-2.5，action=prune"
+      params:
+        # ★ 传递训练配置和硬件上下文，供 skill 做智能决策
+        train_config: "/root/paddlejob/tmp/output/xpu_config.yaml"
+        hardware_context: null   # 默认由 skill 自动探测，主 Agent 也可显式传入
       next: "设置 current_phase='pruned'，进入 Step 3"
 
     - else:
@@ -2048,8 +2056,12 @@ subagent_prompt: |
   【主 Agent 传递的参数】
   - model_path: {model_path}
   - action: {action}              # prune 或 restore
-  - mode: {mode}                  # action=prune 时生效
+  - mode: {mode}                  # action=prune 时生效，通常为 auto
   - component: {component}
+
+  # ★ 智能决策上下文（mode=auto 时由 skill 消费）
+  - train_config: {train_config}                    # 训练配置文件路径（如 xpu_config.yaml），供 skill 分析并行策略/batch/seq_len
+  - hardware_context: {hardware_context}            # 硬件信息，null 时由 skill 自动探测
 
   # ★ YAML 联动恢复参数（仅在 action=restore 时生效）
   - xpu_yaml_path: {xpu_yaml_path}                     # XPU YAML 配置文件路径
@@ -2063,7 +2075,9 @@ subagent_prompt: |
   1. 确定 SKILL_ROOT：根据 CURRENT_SKILL_PATH 计算父目录的父目录
   2. 读取 Skill 文件：{SKILL_ROOT}/prune-model-layers/SKILL.md
   3. 根据 action 调用 Skill：
-     - action == "prune"：调用 `prune-model-layers --mode extreme_fast`
+     - action == "prune"：调用 `prune-model-layers`
+       * 传递 mode（auto 或手动指定）、train_config、hardware_context
+       * Skill 内部自主决策目标层数，或按手动 mode 执行
        * 仅修改 config.json，不涉及 YAML
      - action == "restore"：调用 `prune-model-layers --mode full`
        * 恢复 config.json 层数
@@ -2074,9 +2088,11 @@ subagent_prompt: |
      - current_phase（pruned | full）
      - config_json_restore 状态
      - yaml_restore 状态（含 fields_restored 和 fields_kept）
+     - 如 mode=auto，透传 skill 返回的 decision 字段（显存压力结论、推导 trace）
 
   【约束】
   - 必须调用 prune-model-layers Skill，禁止直接修改 config.json
+  - action=prune 且 mode=auto 时，不得覆盖 skill 的自主决策结果
   - action=restore 时，必须同步处理 YAML 联动恢复
   - 必须透明返回 Skill 结果，不修改结果结构
   - 返回结果包含 special_requirements_status
